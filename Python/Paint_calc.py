@@ -12,3 +12,4 @@ def kolik_barvy(vyska,sirka,pokryti):
 kolik_barvy(vyska,sirka,pokryti)
 
 
+#Pokusny koment
