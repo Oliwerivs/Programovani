@@ -1,0 +1,36 @@
+PROGRAM Hello_V5
+%COMMENT = 'Hello Verze 5.0' --Translator directives
+%NOLOCKGROUP
+%NOPAUSE = ERROR+COMMAND+TPENABLE
+
+VAR -- Declaration of variables
+str_name: STRING[20]
+i_length: INTEGER
+i_status: INTEGER
+
+ROUTINE Get_Name : STRING --Routine declaration
+VAR
+name: STRING[20]
+i_status: INTEGER
+
+BEGIN	
+	WRITE(CHR(128),CHR(137))
+	FORCE_SPMENU(TP_PANEL,SPI_TPUSER,1)
+	WRITE('Zadejte jmeno a stisknete ENTER',CR)
+	name = ''
+	DISCTRL_ALPH('t_fu',2,1,name,'PROG',0,KY_ENTER,i_status)
+	RETURN(name)
+END Get_Name
+
+BEGIN
+	REPEAT
+		str_name = Get_Name
+		i_length = STR_LEN(str_name)
+	UNTIL i_length <> 0
+	
+
+	WRITE(CHR(155),CHR(49),CHR(156),,CHR(156),CHR(148),'Hello, ',str_name,CR)
+	SET_CURSOR(TPDISPLAY,4,1,i_status)
+	WRITE(CHR(155),CHR(48),CHR(156),CHR(127),CHR(153),'Done',CR)
+	
+END Hello_V5

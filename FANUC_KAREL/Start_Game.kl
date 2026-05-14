@@ -1,0 +1,27 @@
+PROGRAM Start_Game
+
+%COMMENT='Start Game'
+%NOLOCKGROUP -- Don't lock any motion groups
+%INCLUDE KLEVKEYS
+
+VAR
+status: INTEGER
+prog_index: INTEGER
+
+ROUTINE tp_cls
+
+BEGIN
+    WRITE(CHR(128),CHR(137)) -- Clear TP display
+    WRITE TPERROR(CR,'              ',CR) 
+    WRITE TPSTATUS(CR,'              ',CR)
+    WRITE TPPROMPT(CR,'              ',CR)
+    WRITE TPFUNCT (CR,'              ',CR)
+
+
+    FORCE_SPMENU(TP_PANEL,SPI_TPUSER,1) 
+
+END tp_cls
+
+BEGIN
+
+END program_name

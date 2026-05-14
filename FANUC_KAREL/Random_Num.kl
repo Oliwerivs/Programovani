@@ -1,0 +1,33 @@
+PROGRAM Random_Num
+
+%COMMENT='Nahodna Cisla' --Translator directives
+%NOLOCKGROUP -- Don't lock any motion groups
+
+CONST
+INCREMENT = 13849
+MODULUS = 65536
+MULTIPLIER = 25173
+
+VAR
+max_num: INTEGER
+seed IN CMOS: INTEGER
+ran_num: INTEGER
+
+--RANDOM Declaration
+--Creates a pseudo-random number and returns it
+ROUTINE random(seed:INTEGER):REAL
+BEGIN
+    seed = (seed * MULTIPLIER + INCREMENT) MOD MODULUS
+    RETURN(seed / 65536.0)
+END random
+
+BEGIN
+    max_num = 100
+
+    --Initialize seed from CMOS clock
+    IF seed = 0 THEN
+        seed = 259
+    ENDIF
+    ran_num = ROUND(ABS((random(seed)*max_num)))
+
+END Random_Num
