@@ -1,0 +1,92 @@
+PROGRAM Calculator
+%COMMENT = 'Calculator Program'
+%NOLOCKGROUP --Don't lock any motion groups for this program
+
+VAR
+Option : INTEGER
+Finish : BOOLEAN
+
+ROUTINE Clr_scn FROM Clr_Screen
+
+ROUTINE Add_Nums(Num1, Num2,Result:REAL)
+
+BEGIN
+    Clr_scn
+    WRITE('Enter the first number. ')
+    READ(Num1)
+    WRITE('Enter the second number. ')
+    READ(Num2)
+    Result = Num1 + Num2
+    
+    WRITE(Num1::9::2,' + ', Num2::9::2, ' = ', Result::9::2,CR)
+END Add_Nums
+
+ROUTINE Sub_Nums(Num1, Num2, Result:REAL)
+
+BEGIN
+    Clr_scn
+    WRITE('Enter the first number. ')
+    READ(Num1)
+    WRITE('Enter the second number. ')
+    READ(Num2)
+    Result = Num1 - Num2
+    WRITE(Num1::9::2,' - ', Num2::9::2, ' = ', Result::9::2,CR)
+END Sub_Nums
+
+ROUTINE Mul_Nums(Num1, Num2, Result:REAL)
+
+BEGIN
+    Clr_scn
+    WRITE('Enter the first number. ')
+    READ(Num1)
+    WRITE('Enter the second number. ')
+    READ(Num2)
+    Result = Num1 * Num2
+    WRITE(Num1::9::2,' * ', Num2::9::2, ' = ', Result::9::2,CR)
+END Mul_Nums
+
+ROUTINE Div_Nums(Num1, Num2, Result:REAL)
+
+BEGIN
+    Clr_scn
+    WRITE('Enter the first number. ')
+    READ(Num1)
+    WRITE('Enter the second number. ')
+    READ(Num2)
+    IF Num2 = 0 THEN
+        WRITE('Division by zero error',CR)
+    ELSE
+        Result = Num1 / Num2
+        WRITE(Num1::9::2,' / ', Num2::9::2, ' = ', Result::9::2,CR)
+    ENDIF
+END Div_Nums
+
+BEGIN
+
+    Finish = FALSE
+
+    REPEAT
+        Start_Select::
+        Clr_scn
+        WRITE('Select an operation:',CR)
+        WRITE('1. Addition',CR)
+        WRITE('2. Subtraction',CR)
+        WRITE('3. Multiplication',CR)
+        WRITE('4. Division',CR)
+        WRITE('5. Exit',CR)
+        WRITE('Enter your choice: ')
+        READ(Option)
+
+        SELECT Option OF
+            CASE(1): Add_Nums
+            CASE(2): Sub_Nums
+            CASE(3): Mul_Nums
+            CASE(4): Div_Nums
+            CASE(5): Finish = TRUE
+            ELSE:
+                WRITE('Invalid option. Please try again.',CR)
+        ENDSELECT
+
+    UNTIL Finish = TRUE
+
+END Calculator

@@ -163,7 +163,7 @@ def main():
     copy_files(source_folder, dest_folder, static_files, "CONF")
 
     # Handle .tp files
-    tp_files = [f for f in os.listdir(source_folder) if f.endswith('.TP')]
+    tp_files = [f for f in os.listdir(source_folder) if f.endswith('.tp')]
     
     if not tp_files:
         print("No .tp files found in the source folder.")
@@ -173,7 +173,7 @@ def main():
             copy_all_tp_files = get_user_input("Do you want to copy all .tp files? (y/n): ").lower()
         
             if copy_all_tp_files == 'y':
-                copy_files(source_folder, dest_folder, tp_files, ".tp")
+                copy_files(source_folder, dest_folder, tp_files, "TP")
         
         
             else:

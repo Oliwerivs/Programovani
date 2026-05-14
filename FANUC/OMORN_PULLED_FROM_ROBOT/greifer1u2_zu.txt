@@ -1,0 +1,20 @@
+.PROGRAM greifer1u2_zu()
+        TYPE "Close both grippers"
+        SIGNAL a_greifer1_zu, -a_greifer1_auf, a_greifer2_zu, -a_greifer2_auf
+        TIMER 1 = 0
+
+        WHILE NOT SIG(e_greifer_1_zu) OR NOT SIG(e_greifer_2_zu) DO
+            WAIT
+            WAIT
+            IF TIMER(1) > 2 THEN
+                hm_crash = TRUE
+                CALL grundstellfahrt()
+            END          ;if
+        END ;while
+
+
+        TIMER 1 = 0
+        WAIT TIMER(1) > 0.1
+
+
+.END

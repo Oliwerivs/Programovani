@@ -1,0 +1,47 @@
+PROGRAM Start_Game 
+%COMMENT = 'Start Game'
+%NOLOCKGROUP --Don't lock any motion groups for this program
+%INCLUDE KLEVKEYS
+
+VAR
+status : INTEGER
+prog_index : INTEGER
+
+ROUTINE tp_cls
+
+BEGIN
+    WRITE(CHR(128),CHR(137)) -- Clear the teach pendant screen
+    WRITE TPERROR (CR,'             ',CR)
+    WRITE TPSTATUS (CR,'             ',CR)
+    WRITE TPPROMPT (CR,'             ',CR)
+    WRITE TPFUNC (CR,'             ',CR)
+    FORCE_SPMENU(TP_PANEL,SPI_TPUSER,1) -- Enable user-defined functions on the teach pendant
+END tp_cls
+
+BEGIN
+    REPEAT
+        tp_cls -- Clear the teach pendant screen
+        WRITE('Do you want to start the game?')
+        WRITE TPPROMPT ('(Select F4 = Yes or F5 = No)')
+        WRITE TPFUNC (CHR(128),CHR(137)) -- Home cursor and Clear to end of line
+
+        SET_CURSOR(TPFUNC,1,26,status)
+        WRITE TPFUNC('YES',CR)
+        SET_CURSOR(TPFUNC,1,34,status)
+        WRITE TPFUNC('NO',CR)
+
+        wait for(TPIN[KY_F4_S]) or (TPIN[KY_F5_S]) -- Wait for the user to press Shift + F4 or F5
+
+        IF TPIN[KY_F4_S]=ON THEN
+            SET_CURSOR(TPDISPLAY,1,1,status)
+            CALL_PROG('Guess_Num',prog_index) -- Call the Guess_Number program
+        ENDIF
+
+        IF TPIN[KY_F5_S]=ON THEN
+            tp_cls
+            SET_CURSOR(TPDISPLAY,1,1,status)
+            WRITE('Game exited. Goodbye!')
+            ABORT
+        ENDIF
+    UNTIL (FALSE)
+END Start_Game

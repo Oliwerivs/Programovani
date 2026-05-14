@@ -1,10 +1,4 @@
-while True:
-    x = 10
+i = int(input("Zadejte celé číslo: "))
 
-    def my_function():
-        global x
-        x += 5
-        print(x)
-
-    my_function()
-    print(x)
+if i % 2 == 1:
+    print("Zadané číslo je liché.",i)

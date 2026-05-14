@@ -1,0 +1,44 @@
+PROGRAM Guess_Num
+%COMMENT = 'Guess the number game'
+%NOLOCKGROUP --Don't lock any motion groups for this program
+
+VAR
+    your_num: INTEGER
+    ran_num FROM Random_Num : INTEGER
+    attempts : INTEGER
+    end_game : BOOLEAN
+
+    status : INTEGER
+    prog_index : INTEGER
+
+ROUTINE tp_cls FROM Start_Game
+
+BEGIN
+    CALL_PROG('RANDOM_NUM',prog_index) -- Call the Random_Num program to generate a random number
+    attempts = 0
+    end_game = FALSE
+
+    tp_cls
+
+    --WRITE('The random number is:',ran_num,CR) -- Uncomment this line for debugging purposes to see the random number
+
+    REPEAT
+        attempts = attempts + 1
+        WRITE('Select a number between 0 and 100:')
+        READ(your_num)
+        WRITE('Your number is:',your_num,CR)
+        IF your_num > ran_num THEN
+            WRITE('Too high! Try again.',CR)
+        ENDIF
+        IF your_num < ran_num THEN
+            WRITE('Too low! Try again.',CR)
+        ENDIF
+        IF your_num = ran_num THEN
+            WRITE('Congratulations! You guessed the number in ', attempts, ' attempts.',CR)
+            end_game = TRUE
+        ENDIF
+    UNTIL (end_game)
+
+    WRITE('Thank you for playing!')
+
+END Guess_Num

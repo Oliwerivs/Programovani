@@ -1,0 +1,60 @@
+-- Builtin function. DO NOT MODIFY
+function sleep(time) for i = 0, time / 100, 1 do sleep_100() end end
+function DoNothing() end
+while(true) do
+
+if get_value("g_FIFO_Init") then
+    set_value("g_FIFO_Index", 1)
+    set_value("g_queue_1", 0)
+    set_value("g_queue_2", 0)
+    set_value("g_queue_3", 0)
+    set_value("g_queue_4", 0)
+    set_value("g_queue_5", 0)
+    set_value("g_queue_6", 0)
+    set_value("g_FIFO_Init", false)
+end
+
+set_value("g_current_trigger", get_standard_digital_in(1))
+if (get_value("g_current_trigger") and not get_value("g_prev_trigger")) then
+    set_value("g_FIFO_Zapis", true)
+end
+
+if get_value("g_FIFO_Zapis") then
+  if get_value("g_FIFO_Index") == 1 then
+        set_value("g_queue_1", read_encoder_count())
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") + 1)
+        elseif get_value("g_FIFO_Index") == 2 then
+        set_value("g_queue_2", read_encoder_count())
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") + 1)
+        elseif get_value("g_FIFO_Index") == 3 then
+        set_value("g_queue_3", read_encoder_count())
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") + 1)
+        elseif get_value("g_FIFO_Index") == 4 then
+        set_value("g_queue_4", read_encoder_count())
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") + 1)
+        elseif get_value("g_FIFO_Index") == 5 then
+        set_value("g_queue_5", read_encoder_count())
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") + 1)
+        elseif get_value("g_FIFO_Index") == 6 then
+        set_value("g_queue_6", read_encoder_count())
+    end
+     set_value("g_FIFO_Zapis",false)
+end
+
+if get_value("g_FIFO_Cteni") then
+    set_value("g_queue_1", get_value("g_queue_2"))
+    set_value("g_queue_2", get_value("g_queue_3"))
+    set_value("g_queue_3", get_value("g_queue_4"))
+    set_value("g_queue_4", get_value("g_queue_5"))
+    set_value("g_queue_5", get_value("g_queue_6"))
+    set_value("g_queue_6", 0)
+    if get_value("g_FIFO_Index") > 1 then
+        set_value("g_FIFO_Index", get_value("g_FIFO_Index") - 1)
+    end
+    set_value("g_FIFO_Cteni",false)
+end
+
+set_value("g_FIFO_actual", get_value("g_queue_1"))
+set_value("g_prev_trigger", get_value("g_current_trigger"))
+sleep(10)
+end

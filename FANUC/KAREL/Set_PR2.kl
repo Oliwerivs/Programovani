@@ -1,0 +1,28 @@
+PROGRAM Set_PR2
+%COMMENT = 'Set PR2'
+%NOLOCKGROUP --Don't lock any motion groups for this program
+%NOPAUSE = ERROR+COMMAND+TPENABLE -- Don't allow pausing the program
+
+VAR
+pos_offset : XYZWPR -- Offset position
+i_increment: INTEGER -- Increment value for adjusting the position
+i_count: INTEGER -- Counter for the number of adjustments made
+i_status: INTEGER -- Status
+prog_index: INTEGER -- Program index
+
+BEGIN
+    i_increment = 100 -- Set the increment value to 100 mm
+    i_count = 1 -- Initialize the counter
+
+    pos_offset=GET_POS_REG(2,i_status) -- Get the current position from position register 2
+    pos_offset.X=0 --initialize the X offset to 0
+    SET_POS_REG(2,pos_offset,i_status) -- Set the position register 2 to the offset position
+    CALL_PROG('MOVE_TO_POS',prog_index) -- Call the MOVE_TO_POS program to move to the new position
+
+    FOR i_count = 1 TO 5 DO 
+        pos_offset.x=i_increment * i_count -- Increment the X offset by the increment value multiplied by the counter
+        SET_POS_REG(2,pos_offset,i_status) -- Update the position register 2 with the new offset position
+        CALL_PROGLIN('MOVE_TO_POS',4,prog_index,FALSE) -- Call the MOVE_TO_POS program to move to the new position
+    ENDFOR
+
+END Set_PR2
