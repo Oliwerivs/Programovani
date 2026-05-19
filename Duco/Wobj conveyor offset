@@ -1,0 +1,18 @@
+set_value("g_trackingOrigin", get_value("g_FIFO_actual"))
+set_value("g_tracking_active", true)  
+
+set_value("g_ConvTune_M",get_value("g_ConvTune_MM")/1000) --Fine tune offset
+
+if (get_value("g_tracking_active")) then --get_value("g_tracking_active")
+        set_value("g_traveled",read_encoder_count() - get_value("g_trackingOrigin"))
+
+        -- Convert encoder counts to meters (tune ENCODER_SCALE to your setup)
+        set_value("g_offset_meters", (get_value("g_traveled") * get_value("g_encoder_scale")/1000) +       get_value"g_ConvTune_M")
+    
+        -- Apply offset along conveyor direction (X axis)
+        set_wobj_offset(true, {get_value("g_offset_meters"), 0, 0, 0, 0, 0})
+    else
+        set_wobj_offset(false, {0, 0, 0, 0, 0, 0})
+    end
+
+    set_value("g_tracking_active", false)
