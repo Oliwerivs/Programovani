@@ -3,18 +3,18 @@
     {
       "name": "ESP8266",
       "intelliSenseMode": "gcc-x64",
-      "compilerPath": "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/tools/xtensa-lx106-elf-gcc/3.1.0-gcc10.3-e5f9fec/bin/xtensa-lx106-elf-gcc.exe",
+      "compilerPath": "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/tools/xtensa-lx106-elf-gcc/3.1.0-gcc10.3-e5f9fec/bin/xtensa-lx106-elf-gcc.exe",
       "includePath": [
         "${workspaceFolder}/**",
 
-        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
-        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/variants/nodemcu",
-        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
-        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/tools/**",
-        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/tools/**",
+        "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
+        "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/variants/nodemcu",
+        "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
+        "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/tools/**",
+        "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/tools/**",
 
-        "C:/Users/obroz/Documents/Arduino/libraries/**",
-        "C:/Users/obroz/AppData/Local/Arduino15/libraries/**"
+        "C:/Users/oldab/OneDrive/Documents/Arduino/libraries/**",
+        "C:/Users/oldab/AppData/Local/Arduino15/libraries/**"
       ],
       "defines": [
         "ARDUINO=10819",
@@ -28,9 +28,9 @@
       "browse": {
         "path": [
           "${workspaceFolder}",
-          "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
-          "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
-          "C:/Users/obroz/Documents/Arduino/libraries/**"
+          "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
+          "C:/Users/oldab/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
+          "C:/Users/oldab/OneDrive/Documents/Arduino/libraries/**"
         ],
         "limitSymbolsToIncludedHeaders": false
       }
