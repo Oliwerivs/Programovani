@@ -1,0 +1,141 @@
+.PROGRAM ablauf()
+
+        ATTACH (0, 0)
+        ACCEL 100, 100
+        COARSE 100
+
+        WAIT (e_automatikbetr == TRUE)
+        CALL grundstellfahrt()
+
+        TYPE "Start main loop"
+    10  
+        WHILE e_leerf_ende DO
+            WAIT
+            WAIT
+        END ;while
+
+        TYPE "cycle = ", TIMER(2)
+        TIMER 2 = 0
+
+
+
+
+; ########## Zyklusbeginn ##########
+        WAIT (e_automatikbetr == TRUE) AND (e_reset_zaehler == FALSE) AND (e_leerf_ende == FALSE)
+        ; Fallunterscheidung : Einzelspurbetrieb
+        WHILE TRUE DO
+
+            ; Bei einspurigem Betrieb werden immer zwei Zyklen durchlaufen, damit bei Zurueckschalten
+            ; auf Normalbetrieb auf jeden Fall eine geradzahlige Nestbelegung vorliegt
+            IF e_spur1_betrieb AND NOT e_spur2_betrieb AND NOT e_zuf_test THEN
+                IF (i == 1) OR (i == 3) OR (i == 5) OR (i == 7) OR (i == 9) GOTO 11 ; bei ungerader Nestbelegung "gerade machen"
+                CALL abhol_aus1()
+                CALL ableg_1()
+    11          
+                CALL abhol_aus1()
+                CALL ableg_1()
+                GOTO 20
+            END ;if
+
+            IF e_spur2_betrieb AND NOT e_spur1_betrieb AND NOT e_zuf_test THEN
+                IF (i == 1) OR (i == 3) OR (i == 5) OR (i == 7) OR (i == 9) GOTO 12 ; bei ungerader Nestbelegung "gerade machen"
+                CALL abhol_aus2()
+                CALL ableg_2()
+    12          
+                CALL abhol_aus2()
+                CALL ableg_2()
+                GOTO 20
+            END ;if
+
+
+            ; Ist eine Spur leer, entnimmt der Roboter nach Ablauf der Zeit aus der anderen Spur
+            ; Timer erst laufen lassen, wenn mindestens eine Spur liefert
+            IF NOT e_teil_1_vorhan AND NOT e_teil_2_vorhan THEN
+                TIMER 1 = 0
+            END         ;if
+
+
+            ; wenn dauerhaft (Timer1>?s) nur eine Spur liefert, dann nur aus dieser Spur entnehmen.
+            ; Es werden dann zwei Zyklen durchlaufen, damit bei Normalbetrieb wieder eine geradzahlige Nestbelegung vorliegt
+            IF (TIMER(1) > 3) AND e_teil_1_vorhan AND NOT e_teil_2_vorhan AND NOT e_zuf_test THEN
+                IF (i == 1) OR (i == 3) OR (i == 5) OR (i == 7) OR (i == 9) GOTO 13 ; bei ungerader Nestbelegung gerade machen
+                CALL abhol_aus1()
+                CALL ableg_1()
+    13          
+                IF e_leerf_ende THEN
+                    a_palett_fertig = TRUE
+                    GOTO 10
+                END ;if
+                IF NOT e_teil_1_vorhan THEN
+                    GOTO 13
+                END ;if
+                CALL abhol_aus1()
+                CALL ableg_1()
+                GOTO 20
+            END ;if
+
+            IF (TIMER(1) > 3) AND NOT e_teil_1_vorhan AND e_teil_2_vorhan AND NOT e_zuf_test THEN
+                IF (i == 1) OR (i == 3) OR (i == 5) OR (i == 7) OR (i == 9) GOTO 14 ; bei ungerader Nestbelegung gerade machen
+                CALL abhol_aus2()
+                CALL ableg_2()
+    14          
+                IF e_leerf_ende THEN
+                    a_palett_fertig = TRUE
+                    GOTO 10
+                END ;if
+                IF NOT e_teil_2_vorhan THEN
+                    GOTO 14
+                END ;if
+                CALL abhol_aus2()
+                CALL ableg_2()
+                GOTO 20
+            END         ;if
+
+            ; Normalbetrieb: beide Greifer arbeiten (falls Nestbelegung geradzahlig)
+            IF e_teil_1_vorhan AND e_teil_2_vorhan THEN
+                IF e_zuf_test THEN
+                    CALL abhol_normal()
+                    CALL zuf_test()
+                    GOTO 20
+                END ;if
+
+                IF (i == 1) OR (i == 3) OR (i == 5) OR (i == 7) OR (i == 9) THEN ; bei ungerader Nestbelegung gerade machen
+                    CALL abhol_aus1()
+                    CALL ableg_1()
+                    GOTO 20
+                ELSE
+                    CALL abhol_normal()
+                    CALL ableg_normal()
+                    GOTO 20
+                END ;if
+            END         ;if
+            IF e_leerf_ende THEN
+                a_palett_fertig = TRUE
+                GOTO 10
+            END ;if
+            WAIT
+            WAIT
+        END    ;while
+
+
+    20  
+        IF e_leerf_ende THEN
+            a_palett_fertig = TRUE
+            GOTO 10
+        END ;if
+
+
+        IF i >= 10 THEN
+            a_palett_fertig = TRUE
+            ;MOVE #p_grundstellung
+            WAIT e_teller_bereit == FALSE
+            WAIT e_teller_bereit == TRUE
+            WAIT
+            WAIT
+        END     ;if
+
+
+        GOTO 10
+
+
+.END

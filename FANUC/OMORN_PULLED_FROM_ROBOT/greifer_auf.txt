@@ -1,0 +1,21 @@
+.PROGRAM greifer_auf()
+        TYPE "Open both grippers"
+        SIGNAL -a_greifer1_zu, a_greifer1_auf, -a_greifer2_zu, a_greifer2_auf
+        TIMER 1 = 0
+
+        WHILE SIG(e_greifer_1_zu) OR SIG(e_greifer_2_zu) DO
+            WAIT
+            WAIT
+            TIMER 1 = 0
+            IF TIMER(1) > 2 THEN
+                a_stoerung = TRUE
+                greifer_stoer = TRUE
+            END           ;if
+        END ;while
+        a_stoerung = FALSE
+
+        TIMER 1 = 0
+        WAIT TIMER(1) > 0.1
+
+
+.END

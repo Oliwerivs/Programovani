@@ -1,0 +1,33 @@
+PROGRAM Random_Num 
+%COMMENT = 'Random number guessing game'
+%NOLOCKGROUP --Don't lock any motion groups for this program
+
+CONST 
+INCREMENT = 13849
+MODULUS = 65536
+MULTIPLIER = 25173
+
+
+VAR
+   max_num : INTEGER
+   seed : INTEGER
+   ran_num : INTEGER
+
+-- Random number generator function
+ROUTINE random(seed:INTEGER):REAL
+    BEGIN
+        seed = (seed * MULTIPLIER + INCREMENT) MOD MODULUS
+        RETURN(seed/65535.0)
+    
+     END random
+
+BEGIN
+   max_num = 100
+
+    -- Initialize the random seed
+    IF seed = 0 THEN
+        seed = 259
+    ENDIF
+
+    ran_num = ROUND(ABS((random(seed) * max_num)))
+END Random_Num

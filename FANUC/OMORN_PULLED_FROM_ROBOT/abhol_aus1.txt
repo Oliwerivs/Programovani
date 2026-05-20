@@ -1,0 +1,26 @@
+.PROGRAM abhol_aus1()
+
+        IF e_leerf_ende THEN
+            RETURN
+        END ;if
+        TYPE "Pick part 1"
+        WAIT e_teil_1_vorhan == TRUE
+
+        hm_crash = TRUE
+        APPROS p_pick, 22
+        MOVES p_pick
+        BREAK
+        hm_crash = FALSE
+
+        CALL greifer1_zu()
+
+        APPROS p_pick, 70
+        BREAK
+
+        a_teil_1_entnom = TRUE
+        WAIT
+        WAIT
+        a_teil_1_entnom = FALSE
+
+
+.END

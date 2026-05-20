@@ -1,0 +1,28 @@
+.PROGRAM abhol_normal()
+        IF e_leerf_ende THEN
+            RETURN
+        END ;if
+        TYPE "Pick both parts"
+        WAIT e_teil_1_vorhan == TRUE
+        WAIT e_teil_2_vorhan == TRUE
+
+        hm_crash = TRUE
+        APPROS p_pick, 22
+        MOVES p_pick
+        BREAK
+        hm_crash = FALSE
+
+        CALL greifer1u2_zu()
+
+        APPROS p_pick, 70
+        BREAK
+
+        a_teil_1_entnom = TRUE
+        a_teil_2_entnom = TRUE
+        WAIT
+        WAIT
+        a_teil_1_entnom = FALSE
+        a_teil_2_entnom = FALSE
+
+
+.END
