@@ -1,0 +1,33 @@
+PROGRAM Speed_Ctrl_V3
+%COMMENT = 'Speed Ctrl V3.0'
+%NOLOCKGROUP
+
+ROUTINE main FROM main
+
+ROUTINE Speed_Sel
+ VAR
+ status : INTEGER
+ is_real : BOOLEAN
+ int_val : INTEGER
+ real_val : REAL
+ mem_reg : INTEGER
+BEGIN
+ GET_REG(3,is_real,int_val,real_val,status)
+ $MCR.$GENOVERRIDE = int_val
+END Speed_Sels
+
+BEGIN
+ 
+ CONDITION[1]:
+  WHEN NOT OPOUT[23] DO 
+   Speed_Sel
+  ENABLE CONDITION[1]
+ ENDCONDITION
+
+ ENABLE CONDITION[1]
+  
+ REPEAT
+  main
+ UNTIL DIN[3]
+ 
+END Speed_Ctrl_V3
