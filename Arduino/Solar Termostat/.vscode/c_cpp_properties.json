@@ -1,0 +1,40 @@
+{
+  "configurations": [
+    {
+      "name": "ESP8266",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/tools/xtensa-lx106-elf-gcc/3.1.0-gcc10.3-e5f9fec/bin/xtensa-lx106-elf-gcc.exe",
+      "includePath": [
+        "${workspaceFolder}/**",
+
+        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
+        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/variants/nodemcu",
+        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
+        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/tools/**",
+        "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/tools/**",
+
+        "C:/Users/obroz/Documents/Arduino/libraries/**",
+        "C:/Users/obroz/AppData/Local/Arduino15/libraries/**"
+      ],
+      "defines": [
+        "ARDUINO=10819",
+        "ESP8266",
+        "ARDUINO_ESP8266_NODEMCU_ESP12E",
+        "ARDUINO_ARCH_ESP8266",
+        "F_CPU=80000000L"
+      ],
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/cores/esp8266",
+          "C:/Users/obroz/AppData/Local/Arduino15/packages/esp8266/hardware/esp8266/*/libraries/**",
+          "C:/Users/obroz/Documents/Arduino/libraries/**"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    }
+  ],
+  "version": 4
+}

@@ -1,0 +1,66 @@
+-- Builtin function. DO NOT MODIFY
+function sleep(time) for i = 0, time / 100, 1 do sleep_100() end end
+function DoNothing() end
+
+FIFO_SIZE = 6
+fifo_buf = {0, 0, 0, 0, 0, 0}
+fifo_index = 1
+fifo_full = false
+prev_trigger = false
+current_trigger = false
+fifo_zapis = false
+
+while true do
+
+    -- init
+    if get_value("g_FIFO_Init") then
+        fifo_buf = {0, 0, 0, 0, 0, 0}
+        fifo_index = 1
+        fifo_zapis = false
+        fifo_full = false
+        prev_trigger = false
+        set_value("g_FIFO_Index", 1)
+        set_value("g_FIFO_Cteni", false)
+        set_value("g_FIFO_Init", false)
+    end
+
+    -- rising edge detection
+    current_trigger = get_standard_digital_in(1)
+    if current_trigger and not prev_trigger then
+      --  fifo_zapis = true
+    --end
+
+    -- write
+    --if fifo_zapis then
+        if fifo_index <= FIFO_SIZE then
+            fifo_buf[fifo_index] = read_encoder_count()
+            if fifo_index < FIFO_SIZE then
+                fifo_index = fifo_index + 1
+            else
+                fifo_full = true
+            end
+        end
+        fifo_zapis = false
+        set_value("g_FIFO_Index", fifo_index)
+    end
+
+    -- read/pop
+    if get_value("g_FIFO_Cteni") then
+        for i = 1, FIFO_SIZE - 1, 1 do
+            fifo_buf[i] = fifo_buf[i + 1]
+        end
+        fifo_buf[FIFO_SIZE] = 0
+        if fifo_index > 1 then
+            fifo_index = fifo_index - 1
+        end
+        fifo_full = false
+        set_value("g_FIFO_Index", fifo_index)
+        set_value("g_FIFO_Cteni", false)
+    end
+
+    -- expose head to main program
+    set_value("g_FIFO_actual", fifo_buf[1])
+    prev_trigger = current_trigger
+    sleep(1)
+   
+end
