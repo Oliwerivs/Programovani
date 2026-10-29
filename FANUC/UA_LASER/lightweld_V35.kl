@@ -1,0 +1,2122 @@
+PROGRAM lightweld
+%COMMENT = 'LightWELD flag drv'
+%NOLOCKGROUP
+%NOBUSYLAMP
+%NOPAUSESHFT
+%NOPAUSE = ERROR + COMMAND + TPENABLE
+%NOABORT = ERROR + COMMAND
+%PRIORITY = 50
+%ENVIRONMENT FLBT
+%ENVIRONMENT REGOPE
+%ENVIRONMENT IOSETUP
+%SYSTEM 
+%INCLUDE kliotyps
+
+-- ============================================================
+-- IPG LightWELD 1500 - TCP driver, controlled by FLAGS F[]
+--
+-- Flags are read / written directly with GET_PORT_VAL / SET_PORT_VAL
+-- and port type io_flag (= 35, defined in KLIOTYPS.KL).
+-- No I/O assignment is needed. Each call returns a status, so a
+-- wrong flag number is reported on the TP instead of stopping the task.
+--
+-- BACKGROUND TASK: start it ONCE with  RUN LIGHTWELD  (not CALL).
+--   * connects to the laser automatically, reconnects after a failure
+--   * keeps running when SHIFT is released, when the TP is enabled,
+--     on robot errors and on ABORT ALL / pause commands
+--   * stop:  R[35] = 1   (disconnects cleanly)
+--            or  KCL> ABORT LIGHTWELD FORCE
+--     Set R[35] = 0 before starting.
+--
+-- Flags IN  (ArcTool -> laser), lowest flag number = LSB
+--   F[705]      Trigger 1        mirrored to a DO, see trigger mirror
+--   F[706]      Trigger 2        mirrored to a DO, see trigger mirror
+--   F[707]      Nozzle           mirrored to DO[693], see trigger mirror
+--   F[708]      Error Reset      rising edge 0 -> 1 sends RERR to the laser
+--   F[713-715]  Process Select   -> SMAT 0 (even value, Steel)
+--                                   SMAT 1 (odd value,  Aluminum)
+--   F[721-736]  Laser Power      -> SPOW  <W>
+--   F[737-752]  Wobble frequency -> SWFREQ <Hz>
+--   F[753-768]  Wobble width     -> SWLEN <mm>
+--   F[769-784]  Compensation     -> SPCF  <%>      (power compensation factor)
+--   Power, wobble frequency, wobble width: sent at once on every change
+--   (ArcTool ramps). Process Select, compensation: sent when changed
+--   and stable for 2 scans.
+--   Laser program: always USER program X, index 0 ("SPROG X 0").
+--   SPROG is sent first after every (re)connect, then all values.
+--   Every poll RPROG is checked; if the laser runs another program or
+--   index (front panel, preset), SPROG and all values are sent again.
+--   A refused SPROG is retried every sprog_retry_ms.
+--
+-- Fixed laser parameters (CONST, checked one per cycle, sent again
+-- when the value read back from the laser differs):
+--   SPREF 0.1 s, SPOSTF 0.1 s  (sent with save = 1 -> non-volatile)
+--   SRMPU 1 ms,  SRMPD 1 ms    (index settings, no save argument)
+--
+-- eBOX wire feeder (only while Process Select F[713-715] = 2 or 3):
+--   DO[286], DO[288] = TRUE; DI[266] -> F[946] eBOX No Error;
+--   errors 51..54 from DI[273], DI[274], DI[285], DI[286-288];
+--   F[849-864] WFS -> byte swap -> GO[31];
+--   GI[31] -> byte swap -> F[1009-1024] WFS
+--
+-- Flags OUT (laser -> ArcTool)
+--   F[865]      IPG No Error     INVERTED: 1 = OK,
+--                                0 = STA alarm active or no connection
+--   F[866]      Emission ON      STG bit 2
+--   F[867]      Process Active   1 = Trigger 1 (F[705]) ON
+--                                    AND Emission ON (STG bit 2)
+--                                    AND no warning No Gas (STW bit 0)
+--                                0 otherwise and when not connected
+--   F[868]      reserved
+--   F[881-896]  Power            RPOW
+--   F[897-912]  Wobble frequency RWFREQ
+--   F[913-928]  Wobble width     RWLEN
+--   F[929-944]  Error code       the FIRST active error is written and
+--                                latched until the error reset F[708];
+--                                then the search starts again.
+--                                Search order:
+--                                1..31    = STA alarm bits
+--                                32       = Interlocks OK (STG bit 0) OFF
+--                                           and Trigger 2 (F[706]) ON
+--                                200      = no connection to the laser
+--                                100..107 = STW warning bits + 100
+--                                51..55   = eBOX errors (eBOX active)
+--                                0        = no error
+--
+-- Trigger mirror (flag -> DO, independent of the laser connection)
+--   DO[691] = Trigger 1  <- F[705]
+--   DO[692] = Trigger 2  <- F[706]
+--   DO[693] = Nozzle     <- F[707]; after a falling edge of Trigger 1
+--             interrupted (OFF) for noz_break_ms = 0.5 s
+--   Updated every main loop, before every laser command and every
+--   20 ms while waiting for a laser reply. Both DO are switched OFF
+--   when the driver stops (R[35] = 1).
+--
+-- Scaling: basic 1:1 for now, change the *_scale constants below.
+--   laser value = flag value * scale,   flag value = laser value / scale
+--
+-- Controller setup: SETUP > Host Comm > TCP/IP > Clients
+--   tag C3, protocol SM, server 10.0.0.20, then START
+--   $HOSTC_CFG[3].$SERVER_PORT = 10001  (MENU > SYSTEM > Variables)
+-- ============================================================
+
+CONST
+  -- stop register
+  reg_stop     = 35
+
+  -- timing
+  poll_ms      = 10       -- pause at the end of each main loop cycle [ms]
+  rx_poll_ms   = 4        -- wanted reply check period [ms]; the real wait step
+                          -- (wait_ms) is at least 2 x $SCR.$COND_TIME, see main
+  reply_tmo_ms = 2000     -- no reply within this time = connection lost [ms]
+  settle_ms    = 5000     -- wait after a (re)connect before the first command;
+                          -- the laser hangs if it gets commands right away
+  n_slow       = 12       -- read items, one per cycle (see poll_status)
+  reconnect_ms = 2000     -- first wait between connection attempts [ms]
+  probe_ms     = 2000     -- laser silent: send one probe (STA) this often [ms]
+  reconnect_max_ms = 30000 -- the wait doubles after every failed attempt
+                          -- up to this value; back to reconnect_ms when
+                          -- the laser answers again
+
+  -- task priority (A.17.18, SET_TSK_ATTR A.20.42; TP manager = 88)
+  prio_online  = 50       -- laser answers: normal priority, fast writes
+  prio_offline = 95       -- laser silent / not connected: below the TP
+                          -- manager, so a blocking connect attempt can
+                          -- never freeze the teach pendant
+
+  -- optional PING before every connection attempt (A.14.10 MSG_PING).
+  -- Needs an entry for the laser in SETUP > Host Comm > TCP/IP > Host Name
+  -- table: name IPG -> 10.0.0.20. Then set use_ping = TRUE.
+  use_ping     = FALSE    -- TRUE caused system error OS-026 after power-up
+  sprog_retry_ms = 5000   -- wait before repeating a refused SPROG [ms]
+
+  -- laser program: always USER program X with this index
+  prog_index   = 0
+
+  -- flags are accessed with port type io_flag (KLIOTYPS.KL, value 35)
+
+  -- flags IN (ArcTool -> laser)
+  fi_trig1     = 705
+  fi_trig2     = 706
+  fi_nozzle    = 707      -- mirrored to DO[693]
+  fi_reset     = 708      -- error reset, rising edge -> RERR
+  fi_psel      = 713      -- 3 bits, even -> SMAT 0, odd -> SMAT 1
+  fi_power     = 721      -- 16 bits
+  fi_wfreq     = 737      -- 16 bits
+  fi_wlen      = 753      -- 16 bits
+  fi_comp      = 769      -- 16 bits
+
+  -- flags OUT (laser -> ArcTool)
+  fo_error     = 865      -- inverted: 1 = OK, 0 = alarm / no connection
+  fo_emission  = 866
+  fo_pactive   = 867      -- Trigger 1 AND Emission ON AND NOT No Gas
+  fo_power     = 881      -- 16 bits
+  fo_wfreq     = 897      -- 16 bits
+  fo_wlen      = 913      -- 16 bits
+  fo_errcode   = 929      -- 16 bits
+  -- F[868] reserved
+
+  -- trigger mirror: source flag -> DO (signal table, column M)
+  do_trig1     = 691      -- DO[691] = Trigger 1
+  trig1_src    = 705      --   from F[705]
+  do_trig2     = 692      -- DO[692] = Trigger 2
+  trig2_src    = 706      --   from F[706]
+  do_nozzle    = 693      -- DO[693] = Nozzle, from F[707] (fi_nozzle)
+  noz_break_ms = 500      -- Trigger 1 falling edge: nozzle mirror
+                          -- interrupted for this time, DO[693] = OFF [ms]
+
+  -- scaling (basic 1:1, adjust later)
+  power_scale  = 1.0      -- W  per bit
+  wfreq_scale  = 1.0      -- Hz per bit
+  wlen_scale   = 0.1      -- mm per bit
+  comp_scale   = 1.0      -- %  per bit
+
+  -- fixed laser parameters, kept by check_const (read back cyclically,
+  -- sent again when the laser value differs)
+  pref_s       = 0.1      -- SPREF  gas pre-flow  [s]   (IPG 2.25, sent with save = 1)
+  postf_s      = 0.1      -- SPOSTF gas post-flow [s]   (IPG 2.27, sent with save = 1)
+  rmpu_ms      = 1        -- SRMPU  ramp up       [ms]  (IPG 2.43, USER program)
+  rmpd_ms      = 1        -- SRMPD  ramp down     [ms]  (IPG 2.45, USER program)
+  n_cst        = 4        -- number of fixed parameters
+  cst_tol      = 0.0005   -- tolerance for the REAL compare [s]
+  cst_retry_ms = 5000     -- wait before repeating a refused SET [ms]
+
+  -- TP message line control characters (B-83144EN-1/02, Appendix D)
+  cc_clear_win = 128      -- clear window
+  cc_home      = 137      -- home cursor
+
+  -- error code written when there is no connection to the laser
+  err_no_conn  = 200      -- 100..107 are used by the STW warnings
+  warn_ofs     = 100      -- error code = STW bit + warn_ofs
+  err_ilock    = 32       -- STG bit 0 Interlocks OK = OFF and Trigger 2 ON
+
+  -- error code: the first active error (in the order of collect_errors)
+  -- is written and latched until the error reset F[708] (rising edge);
+  -- after the reset the search starts again from the beginning
+  max_err      = 48       -- size of the error list
+
+  -- ---- eBOX wire feeder (active only when Process Select = 2 or 3) ----
+  ebox_psel_a  = 2        -- Process Select values that enable the eBOX
+  ebox_psel_b  = 3
+  do_ebox_w1   = 286      -- DO[286] eBOX Op Mode W1  = TRUE while active
+  do_ebox_w3   = 288      -- DO[288] eBOX Op Mode W3  = TRUE while active
+  di_ebox_ok   = 266      -- DI[266] eBOX No Error -> F[946] as it is;
+                          -- F[946] = 1 while the eBOX is not used
+  fo_ebox_ok   = 946
+  di_ebox_cbl  = 273      -- DI[273] Ctrl Cable Conn  0 -> error 51
+  di_ebox_mot  = 274      -- DI[274] No Motor Ctl Err 0 -> error 52
+  di_ebox_key  = 285      -- DI[285] Keysw Auto       0 -> error 53
+  di_ebox_m1   = 286      -- DI[286] Ask Op Mode W1 \
+  di_ebox_m2   = 287      -- DI[287] Ask Op Mode W2  > W1=0 or W2=1 or W3=0 -> 54
+  di_ebox_m3   = 288      -- DI[288] Ask Op Mode W3 /
+  err_ebox_cbl = 51       -- Control cable disconnected
+  err_ebox_mot = 52       -- eBox internal fault
+  err_ebox_key = 53       -- eBox key not in auto
+  err_ebox_mod = 54       -- eBox mode select error
+  err_ebox_rel = 55       -- eBox process not released
+  fi_ebox_wfs  = 849      -- F[849-864] eBOX WFS from ArcTool (16 bits)
+  go_ebox_wfs  = 31       -- GO[31] WFS to the eBOX (bytes swapped)
+  gi_ebox_wfs  = 31       -- GI[31] WFS from the eBOX (bytes swapped)
+  fo_ebox_wfs  = 1009     -- F[1009-1024] eBOX WFS to ArcTool (16 bits)
+  fi_ebox_fwd  = 787      -- F[787] eBOX Start Forward request (ArcTool)
+  do_ebox_rst  = 266      -- DO[266] eBOX Error Reset = error reset F[708]
+  do_ebox_rel  = 265      -- DO[265] eBOX Process Release = Trigger 1 (F[705])
+  di_ebox_rdy  = 265      -- DI[265] eBOX System Ready, expected after release
+  ebox_rel_tmo = 1000     -- release ON and DI[265] not ON within this
+                          -- time -> error 55 [ms]
+  do_ebox_fwd  = 267      -- DO[267] eBOX Start Forward = F[787]
+  fi_ebox_inch = 788      -- F[788] eBOX Inching (ArcTool)
+  do_ebox_inch = 268      -- DO[268] eBOX Inching = F[788]
+  fi_ebox_bwd  = 789      -- F[789] eBOX Start Backward (ArcTool)
+  do_ebox_bwd  = 269      -- DO[269] eBOX Start Backward = F[789]
+
+  -- input channels
+  in_mat       = 1        -- Process Select parity -> SMAT
+  in_power     = 2
+  in_wfreq     = 3
+  in_wlen      = 4
+  in_comp      = 5
+  n_in         = 5
+
+  -- output channels (index into out_last)
+  out_error    = 1
+  out_emis     = 2
+  out_errcode  = 3
+  out_power    = 4
+  out_wfreq    = 5
+  out_wlen     = 6
+  out_pactive  = 7
+  n_out        = 7
+
+VAR
+  socket_file   : FILE
+  client_tag    : STRING[4]
+  connected     : BOOLEAN
+  file_open     : BOOLEAN
+  stop_req      : BOOLEAN
+  detail_code   : INTEGER
+  last_cmd      : STRING[60]               -- last command sent (for error messages)
+  last_reply    : STRING[120]              -- last reply received (for error messages)
+  karel_stat    : INTEGER
+  wait_ms       : INTEGER                  -- real DELAY step, >= 2 x $SCR.$COND_TIME
+  reconnect_cur : INTEGER                  -- current wait between attempts [ms]
+  cur_prio      : INTEGER                  -- current task priority, -1 = unknown
+  probe_reply   : STRING[254]              -- reply of the probe STA
+  loop_ms       : INTEGER                  -- main loop pause, >= wait_ms
+  cond_time     : INTEGER                  -- $SCR.$COND_TIME [ms]
+  cond_entry    : INTEGER                  -- GET_VAR entry (do not modify)
+  laser_host    : STRING[16]               -- host name for MSG_PING
+  sys_ready     : BOOLEAN                  -- $PWRUP_DELAY.$SY_READY was TRUE
+  sys_rdy_val   : BOOLEAN                  -- value read by GET_VAR
+  sys_rdy_entry : INTEGER                  -- GET_VAR entry (do not modify)
+  sys_rdy_err   : BOOLEAN                  -- GET_VAR error already reported
+  no_conn_shown : BOOLEAN                  -- "no connection" already reported
+  retry_count   : INTEGER
+
+  in_port       : ARRAY[n_in] OF INTEGER
+  in_bits       : ARRAY[n_in] OF INTEGER
+  in_prev       : ARRAY[n_in] OF INTEGER   -- value read in the previous scan
+  in_sent       : ARRAY[n_in] OF INTEGER   -- value last sent, -1 = must send
+  in_err_shown  : ARRAY[n_in] OF BOOLEAN
+
+  out_last      : ARRAY[n_out] OF INTEGER  -- value last written, -1 = unknown
+  out_err_shown : ARRAY[n_out] OF BOOLEAN
+
+  sta_bad_shown : BOOLEAN                  -- non-numeric STA reply already reported
+  rst_last      : INTEGER                  -- last state of the reset flag, -1 = unknown
+  sprog_ok      : BOOLEAN                  -- SPROG X <prog_index> accepted
+  sprog_retry   : INTEGER                  -- cycles until the next SPROG attempt
+
+  -- trigger mirror (index 1 = Trigger 1, 2 = Trigger 2)
+  trig_src      : ARRAY[2] OF INTEGER      -- source flag number
+  trig_do       : ARRAY[2] OF INTEGER      -- target DO number
+  trig_last     : ARRAY[2] OF INTEGER      -- last value written, -1 = unknown
+  trig_err      : ARRAY[2] OF BOOLEAN      -- error already reported
+  noz_last      : INTEGER                  -- nozzle DO last value, -1 = unknown
+  noz_err       : BOOLEAN                  -- nozzle mirror error already reported
+  trig1_prev    : BOOLEAN                  -- Trigger 1 in the previous scan
+  noz_break     : BOOLEAN                  -- nozzle mirror interrupted
+  noz_break_t0  : INTEGER                  -- clock_ms when the interruption started
+
+  slow_idx      : INTEGER                  -- slow read-back done in this cycle
+
+  -- Process Active inputs
+  trig1_on      : BOOLEAN                  -- F[705] Trigger 1 (read by trig_mirror)
+  emis_on       : BOOLEAN                  -- STG bit 2 Emission ON
+  no_gas        : BOOLEAN                  -- STW bit 0 No Gas
+
+  -- error code sources (combined by update_errcode)
+  sta_code      : INTEGER                  -- first active STA bit, 0 = none
+  stw_code      : INTEGER                  -- 100 + first STW bit, 0 = none
+  las_nc        : BOOLEAN                  -- laser connection failed (code 200)
+  ebox_code     : INTEGER                  -- 51..54, 0 = none / eBOX inactive
+  ebox_err      : ARRAY[4] OF BOOLEAN      -- eBOX errors 51..54 active
+
+  -- raw laser state for the error list
+  g_sta_lo      : INTEGER                  -- last STA, bits 0..15
+  g_sta_hi      : INTEGER                  -- last STA, bits 16..31
+  g_stw         : INTEGER                  -- last STW
+  ilock_ok      : BOOLEAN                  -- STG bit 0 Interlocks OK
+  trig2_on      : BOOLEAN                  -- F[706] Trigger 2
+
+  -- error code
+  cur_list      : ARRAY[max_err] OF INTEGER  -- errors active in this cycle
+  cur_n         : INTEGER
+  err_latched   : BOOLEAN                  -- an error code is latched (wait for reset)
+  err_reset_req : BOOLEAN                  -- F[708] rising edge seen
+
+  -- eBOX
+  ebox_on       : BOOLEAN                  -- eBOX logic active (psel 2 / 3)
+  ebox_ok_last  : INTEGER                  -- F[946] last written, -1 = unknown
+  ebox_go_last  : INTEGER                  -- GO[31] last written, -1 = unknown
+  ebox_fo_last  : INTEGER                  -- F[1009..] last written, -1 = unknown
+  ebox_err_shown : BOOLEAN                 -- eBOX I/O error already reported
+  ebox_fwd_last : INTEGER                  -- DO[267] last written, -1 = unknown
+  ebox_inch_last : INTEGER                 -- DO[268] last written, -1 = unknown
+  ebox_bwd_last : INTEGER                  -- DO[269] last written, -1 = unknown
+  ebox_rst_last : INTEGER                  -- DO[266] last written, -1 = unknown
+  ebox_rel_last : INTEGER                  -- DO[265] last written, -1 = unknown
+  ebox_rel_t0   : INTEGER                  -- clock_ms when the release went ON
+  ebox_err55    : BOOLEAN                  -- error 55 active
+  clock_ms      : INTEGER                  -- ms clock (CONNECT TIMER, A.4.38)
+
+  init_idx      : INTEGER
+
+  -- fixed parameters (check_const)
+  cst_idx       : INTEGER                  -- parameter checked in this cycle
+  cst_wait      : ARRAY[n_cst] OF INTEGER  -- checks to skip after a refused SET
+  cst_err_shown : ARRAY[n_cst] OF BOOLEAN  -- refused SET already reported
+
+
+-- ------------------------------------------------------------
+-- Clear the TP message line before a new message, so that the rest
+-- of a longer previous message does not stay at the end of the line
+-- (same as the manual examples: WRITE TPERROR (CHR(cc_clear_win),
+-- CHR(cc_home)) before the message).
+-- ------------------------------------------------------------
+ROUTINE tp_clr
+BEGIN
+  WRITE TPERROR(CHR(cc_clear_win), CHR(cc_home))
+END tp_clr
+
+-- ------------------------------------------------------------
+-- Change the priority of this task (only when it differs)
+-- SET_TSK_ATTR: a blank task name means the calling task (A.20.42)
+-- ------------------------------------------------------------
+ROUTINE set_prio(prio : INTEGER)
+VAR
+  stat : INTEGER
+BEGIN
+  IF prio <> cur_prio THEN
+    SET_TSK_ATTR('', TSK_PRIORITY, prio, stat)
+    IF stat = 0 THEN
+      cur_prio = prio
+    ENDIF
+  ENDIF
+END set_prio
+
+-- ------------------------------------------------------------
+-- Schedule the next connection attempt and double the wait
+-- for the attempt after that (up to reconnect_max_ms)
+-- ------------------------------------------------------------
+ROUTINE next_attempt
+BEGIN
+  retry_count = reconnect_cur DIV loop_ms
+  reconnect_cur = reconnect_cur * 2
+  IF reconnect_cur > reconnect_max_ms THEN
+    reconnect_cur = reconnect_max_ms
+  ENDIF
+END next_attempt
+
+-- ------------------------------------------------------------
+-- Integer -> string (decimal)
+-- ------------------------------------------------------------
+ROUTINE int_str(number : INTEGER; out_str : STRING)
+VAR
+  work_val, digit : INTEGER
+  is_negative  : BOOLEAN
+BEGIN
+  out_str = ''
+  is_negative = FALSE
+  work_val = number
+  IF work_val < 0 THEN
+    is_negative = TRUE
+    work_val = -work_val
+  ENDIF
+  IF work_val = 0 THEN
+    out_str = '0'
+  ENDIF
+  WHILE work_val > 0 DO
+    digit = work_val MOD 10
+    out_str = CHR(48 + digit) + out_str
+    work_val = work_val DIV 10
+  ENDWHILE
+  IF is_negative THEN
+    out_str = '-' + out_str
+  ENDIF
+END int_str
+
+-- ------------------------------------------------------------
+-- Real -> string with 3 decimals
+-- ------------------------------------------------------------
+ROUTINE real_str(number : REAL; out_str : STRING)
+VAR
+  abs_val      : REAL
+  int_part, frac_part : INTEGER
+  frac_str     : STRING[8]
+  is_negative    : BOOLEAN
+BEGIN
+  is_negative = FALSE
+  abs_val = number
+  IF abs_val < 0 THEN
+    is_negative = TRUE
+    abs_val = -abs_val
+  ENDIF
+  int_part = TRUNC(abs_val)
+  frac_part = ROUND((abs_val - int_part) * 1000)
+  IF frac_part >= 1000 THEN
+    int_part = int_part + 1
+    frac_part = frac_part - 1000
+  ENDIF
+  int_str(int_part, out_str)
+  int_str(frac_part, frac_str)
+  WHILE STR_LEN(frac_str) < 3 DO
+    frac_str = '0' + frac_str
+  ENDWHILE
+  out_str = out_str + '.' + frac_str
+  IF is_negative THEN
+    out_str = '-' + out_str
+  ENDIF
+END real_str
+
+-- ------------------------------------------------------------
+-- Write value to n_bits consecutive flags F[first_flag..]
+-- (first flag = LSB), port type io_flag.
+-- Only writes when the value differs from the last one written.
+-- A failing port is reported once on the TP message line.
+-- ------------------------------------------------------------
+ROUTINE write_group(out_idx : INTEGER; first_flag : INTEGER; n_bits : INTEGER; value : INTEGER)
+VAR
+  bit_no, work_val, stat : INTEGER
+  all_ok : BOOLEAN
+BEGIN
+  IF value = out_last[out_idx] THEN
+    RETURN
+  ENDIF
+  all_ok = TRUE
+  work_val = value
+  FOR bit_no = 0 TO n_bits - 1 DO
+    SET_PORT_VAL(io_flag, first_flag + bit_no, work_val MOD 2, stat)
+    IF stat <> 0 THEN
+      all_ok = FALSE
+      IF NOT out_err_shown[out_idx] THEN
+        tp_clr
+        WRITE TPERROR('LW: F[', (first_flag + bit_no)::1, '] write status ', stat::1, CR)
+        out_err_shown[out_idx] = TRUE
+      ENDIF
+    ENDIF
+    work_val = work_val DIV 2
+  ENDFOR
+  IF all_ok THEN
+    out_last[out_idx] = value
+    out_err_shown[out_idx] = FALSE
+  ENDIF
+END write_group
+
+-- ------------------------------------------------------------
+-- Flag state while there is no connection to the laser
+-- ------------------------------------------------------------
+ROUTINE outputs_disconnected
+BEGIN
+  write_group(out_error, fo_error, 1, 0)         -- inverted: 0 = not OK
+  write_group(out_emis, fo_emission, 1, 0)
+  write_group(out_pactive, fo_pactive, 1, 0)
+  emis_on = FALSE
+  sta_code = 0
+  stw_code = 0
+  g_sta_lo = 0
+  g_sta_hi = 0
+  g_stw = 0
+  ilock_ok = TRUE                   -- unknown: no error 32
+  las_nc = TRUE                     -- error code 200 (update_errcode)
+END outputs_disconnected
+
+-- ------------------------------------------------------------
+-- Close the socket file (only if open) and disconnect the tag
+-- ------------------------------------------------------------
+ROUTINE lw_close
+VAR
+  status : INTEGER
+BEGIN
+  connected = FALSE                 -- first, in case CLOSE / DISCO take long
+  -- disconnect the tag FIRST: a CLOSE FILE on a socket whose peer has
+  -- disappeared may wait for the peer; after MSG_DISCO the socket is
+  -- already down and CLOSE FILE only releases the file variable
+  MSG_DISCO(client_tag, status)
+  IF file_open THEN
+    file_open = FALSE
+    CLOSE FILE socket_file
+  ENDIF
+END lw_close
+
+-- ------------------------------------------------------------
+-- Open the socket. Returns 0 = OK, else KAREL status code
+-- ------------------------------------------------------------
+ROUTINE lw_connect : INTEGER
+VAR
+  status : INTEGER
+BEGIN
+  lw_close
+  IF use_ping THEN
+    MSG_PING(laser_host, status)    -- laser not reachable -> skip MSG_CONNECT
+    IF status <> 0 THEN
+      RETURN(status)
+    ENDIF
+  ENDIF
+  MSG_CONNECT(client_tag, status)
+  IF status <> 0 THEN
+    RETURN(status)
+  ENDIF
+  SET_FILE_ATR(socket_file, ATR_UF)
+  SET_FILE_ATR(socket_file, ATR_IA)
+  OPEN FILE socket_file ('RW', client_tag)
+  status = IO_STATUS(socket_file)
+  IF status <> 0 THEN
+    MSG_DISCO(client_tag, karel_stat)
+    RETURN(status)
+  ENDIF
+  file_open = TRUE
+  RETURN(0)
+END lw_connect
+
+-- ------------------------------------------------------------
+-- Trigger mirror: copy the trigger flags to their DO.
+-- Writes a DO only when the value changed. Called from the main loop,
+-- before every laser command and while waiting for a laser reply,
+-- so a slow laser answer does not delay the triggers.
+-- ------------------------------------------------------------
+ROUTINE trig_mirror
+VAR
+  t_idx, bit_val, stat : INTEGER
+BEGIN
+  FOR t_idx = 1 TO 2 DO
+    GET_PORT_VAL(io_flag, trig_src[t_idx], bit_val, stat)
+    IF stat <> 0 THEN
+      IF NOT trig_err[t_idx] THEN
+        tp_clr
+        WRITE TPERROR('LW: trig F[', trig_src[t_idx]::1, '] read status ', stat::1, CR)
+        trig_err[t_idx] = TRUE
+      ENDIF
+    ELSE
+      IF t_idx = 1 THEN
+        trig1_on = (bit_val <> 0)   -- used for Process Active
+        IF trig1_prev AND (NOT trig1_on) THEN
+          noz_break = TRUE          -- falling edge: interrupt the nozzle
+          noz_break_t0 = clock_ms
+        ENDIF
+        trig1_prev = trig1_on
+      ENDIF
+      IF t_idx = 2 THEN
+        trig2_on = (bit_val <> 0)   -- used for error 32
+      ENDIF
+      IF bit_val <> trig_last[t_idx] THEN
+        SET_PORT_VAL(io_dout, trig_do[t_idx], bit_val, stat)
+        IF stat <> 0 THEN
+          IF NOT trig_err[t_idx] THEN
+            tp_clr
+            WRITE TPERROR('LW: trig DO[', trig_do[t_idx]::1, '] write status ', stat::1, CR)
+            trig_err[t_idx] = TRUE
+          ENDIF
+        ELSE
+          trig_last[t_idx] = bit_val
+          trig_err[t_idx] = FALSE
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDFOR
+
+  -- Nozzle: F[707] -> DO[693]
+  -- after a falling edge of Trigger 1 the mirror is interrupted for
+  -- noz_break_ms: DO[693] = OFF, then the mirror continues
+  IF noz_break THEN
+    IF (clock_ms - noz_break_t0) < noz_break_ms THEN
+      IF noz_last <> 0 THEN
+        SET_PORT_VAL(io_dout, do_nozzle, 0, stat)
+        IF stat = 0 THEN
+          noz_last = 0
+        ENDIF
+      ENDIF
+      RETURN
+    ENDIF
+    noz_break = FALSE               -- time is over: mirror again
+  ENDIF
+  GET_PORT_VAL(io_flag, fi_nozzle, bit_val, stat)
+  IF stat <> 0 THEN
+    IF NOT noz_err THEN
+      tp_clr
+      WRITE TPERROR('LW: nozzle F[', fi_nozzle::1, '] read status ', stat::1, CR)
+      noz_err = TRUE
+    ENDIF
+  ELSE
+    IF bit_val <> noz_last THEN
+      SET_PORT_VAL(io_dout, do_nozzle, bit_val, stat)
+      IF stat <> 0 THEN
+        IF NOT noz_err THEN
+          tp_clr
+          WRITE TPERROR('LW: nozzle DO[', do_nozzle::1, '] write status ', stat::1, CR)
+          noz_err = TRUE
+        ENDIF
+      ELSE
+        noz_last = bit_val
+        noz_err = FALSE
+      ENDIF
+    ENDIF
+  ENDIF
+END trig_mirror
+
+-- ------------------------------------------------------------
+-- Switch both trigger DO and the nozzle DO off (driver stop)
+-- ------------------------------------------------------------
+ROUTINE trig_off
+VAR
+  t_idx, stat : INTEGER
+BEGIN
+  FOR t_idx = 1 TO 2 DO
+    SET_PORT_VAL(io_dout, trig_do[t_idx], 0, stat)
+    trig_last[t_idx] = -1
+  ENDFOR
+  SET_PORT_VAL(io_dout, do_nozzle, 0, stat)
+  noz_last = -1
+END trig_off
+
+-- ------------------------------------------------------------
+-- Raw send + receive one CR-terminated reply
+-- Returns 0 OK, -1 timeout, else I/O status
+-- ------------------------------------------------------------
+ROUTINE lw_cmd(cmd : STRING; reply : STRING) : INTEGER
+VAR
+  bytes_avail, status, wait_count : INTEGER
+  rx_char        : STRING[1]
+  msg       : STRING[200]
+  rx_complete      : BOOLEAN
+BEGIN
+  reply = ''
+  trig_mirror                       -- keep triggers up to date
+
+  -- flush stale input
+  BYTES_AHEAD(socket_file, bytes_avail, status)
+  IF status <> 0 THEN
+    RETURN(status)
+  ENDIF
+  WHILE bytes_avail > 0 DO
+    READ socket_file(rx_char::1)
+    status = IO_STATUS(socket_file)
+    IF status <> 0 THEN
+      RETURN(status)
+    ENDIF
+    bytes_avail = bytes_avail - 1
+  ENDWHILE
+
+  msg = cmd + CHR(13)
+  WRITE socket_file(msg::STR_LEN(msg))
+  status = IO_STATUS(socket_file)
+  IF status <> 0 THEN
+    RETURN(status)
+  ENDIF
+
+  wait_count = 0
+  rx_complete = FALSE
+  WHILE NOT rx_complete DO
+    BYTES_AHEAD(socket_file, bytes_avail, status)
+    IF status <> 0 THEN
+      RETURN(status)
+    ENDIF
+    IF bytes_avail = 0 THEN
+      DELAY wait_ms                 -- always a real pause (see main)
+      trig_mirror                   -- keep triggers up to date while waiting
+      wait_count = wait_count + 1
+      IF wait_count > (reply_tmo_ms DIV wait_ms) THEN
+        RETURN(-1)
+      ENDIF
+    ELSE
+      READ socket_file(rx_char::1)
+      status = IO_STATUS(socket_file)
+      IF status <> 0 THEN
+        RETURN(status)
+      ENDIF
+      IF rx_char = CHR(13) THEN
+        rx_complete = TRUE
+      ELSE
+        reply = reply + rx_char
+      ENDIF
+    ENDIF
+  ENDWHILE
+  RETURN(0)
+END lw_cmd
+
+-- ------------------------------------------------------------
+-- Command with result mapping + connection handling
+-- 0 OK, 1 laser ERROR / empty reply, -1 comm error (connection closed),
+-- -2 not connected
+-- ------------------------------------------------------------
+ROUTINE lw_xchg(cmd : STRING; reply : STRING) : INTEGER
+VAR
+  status : INTEGER
+BEGIN
+  IF NOT connected THEN
+    RETURN(-2)
+  ENDIF
+  last_cmd = SUB_STR(cmd, 1, 60)
+  last_reply = ''
+  status = lw_cmd(cmd, reply)
+  last_reply = SUB_STR(reply, 1, 120)
+  IF status = 0 THEN
+    -- the laser answers: normal priority, short reconnect wait again
+    set_prio(prio_online)
+    reconnect_cur = reconnect_ms
+  ENDIF
+  IF status <> 0 THEN
+    -- laser lost: report and set the flags first
+    detail_code = status
+    connected = FALSE
+    IF NOT no_conn_shown THEN
+      tp_clr
+      WRITE TPERROR('LW: connection lost, status ', status::1, CR)
+    ENDIF
+    outputs_disconnected            -- F[865] = 0, error code = 200
+    no_conn_shown = TRUE            -- main loop does not report again
+    set_prio(prio_offline)          -- never block the TP while offline
+    IF status = -1 THEN
+      -- TIMEOUT (laser silent, e.g. switched off): the socket is NOT
+      -- closed. MSG_DISCO on a socket whose peer has disappeared blocks
+      -- for ~22 s and freezes the TP (measured on the robot). The open
+      -- socket is probed every probe_ms (main loop): the laser answers
+      -- again -> go on; the socket reports an I/O error (e.g. the laser
+      -- was restarted and resets the old connection) -> then it is
+      -- closed and a new connection is made.
+      retry_count = probe_ms DIV loop_ms
+    ELSE
+      -- I/O error: the socket is broken -> close and reconnect
+      next_attempt                  -- growing wait before the reconnect
+      lw_close
+    ENDIF
+    RETURN(-1)
+  ENDIF
+  IF STR_LEN(reply) = 0 THEN
+    RETURN(1)
+  ENDIF
+  IF INDEX(reply, 'ERROR') > 0 THEN
+    RETURN(1)
+  ENDIF
+  RETURN(0)
+END lw_xchg
+
+-- ------------------------------------------------------------
+-- Value part after "CMD: "
+-- ------------------------------------------------------------
+ROUTINE lw_value(reply : STRING; value : STRING)
+VAR
+  colon_pos : INTEGER
+BEGIN
+  value = ''
+  colon_pos = INDEX(reply, ': ')
+  IF colon_pos > 0 THEN
+    value = SUB_STR(reply, colon_pos + 2, STR_LEN(reply) - colon_pos - 1)
+  ENDIF
+END lw_value
+
+-- ------------------------------------------------------------
+-- GET command returning one integer (-4 = reply not numeric)
+-- ------------------------------------------------------------
+ROUTINE lw_get_int(cmd : STRING; out_value : INTEGER) : INTEGER
+VAR
+  rc, parsed : INTEGER
+  reply_buf : STRING[254]
+  value_text   : STRING[40]
+BEGIN
+  rc = lw_xchg(cmd, reply_buf)
+  IF rc = 0 THEN
+    lw_value(reply_buf, value_text)
+    CNV_STR_INT(value_text, parsed)
+    IF UNINIT(parsed) THEN
+      rc = -4
+    ELSE
+      out_value = parsed
+    ENDIF
+  ENDIF
+  RETURN(rc)
+END lw_get_int
+
+-- ------------------------------------------------------------
+-- GET command returning one real (-4 = reply not numeric)
+-- ------------------------------------------------------------
+ROUTINE lw_get_real(cmd : STRING; out_value : REAL) : INTEGER
+VAR
+  rc   : INTEGER
+  parsed   : REAL
+  reply_buf : STRING[254]
+  value_text   : STRING[40]
+BEGIN
+  rc = lw_xchg(cmd, reply_buf)
+  IF rc = 0 THEN
+    lw_value(reply_buf, value_text)
+    CNV_STR_REAL(value_text, parsed)
+    IF UNINIT(parsed) THEN
+      rc = -4
+    ELSE
+      out_value = parsed
+    ENDIF
+  ENDIF
+  RETURN(rc)
+END lw_get_real
+
+-- ------------------------------------------------------------
+-- GET command returning one unsigned 32-bit decimal value (e.g. STA).
+-- Parsed digit by digit into two 16-bit halves, so the full U32 range
+-- 0..4294967295 works without INTEGER overflow.
+-- Returns 0 OK, -4 reply not a decimal number, or lw_xchg result.
+-- ------------------------------------------------------------
+ROUTINE lw_get_u32(cmd : STRING; lo_out : INTEGER; hi_out : INTEGER) : INTEGER
+VAR
+  rc, pos, code, carry, lo, hi, digits : INTEGER
+  reply_buf  : STRING[254]
+  value_text : STRING[40]
+BEGIN
+  rc = lw_xchg(cmd, reply_buf)
+  IF rc <> 0 THEN
+    RETURN(rc)
+  ENDIF
+  lw_value(reply_buf, value_text)
+  lo = 0
+  hi = 0
+  digits = 0
+  FOR pos = 1 TO STR_LEN(value_text) DO
+    code = ORD(value_text, pos)
+    IF (code >= 48) AND (code <= 57) THEN       -- '0'..'9'
+      lo = lo * 10 + (code - 48)
+      carry = lo DIV 65536
+      lo = lo MOD 65536
+      hi = hi * 10 + carry
+      IF hi > 65535 THEN
+        RETURN(-4)                              -- more than 32 bits
+      ENDIF
+      digits = digits + 1
+    ELSE
+      IF code <> 32 THEN                        -- spaces are ignored
+        RETURN(-4)                              -- hex, sign or text
+      ENDIF
+    ENDIF
+  ENDFOR
+  IF digits = 0 THEN
+    RETURN(-4)
+  ENDIF
+  lo_out = lo
+  hi_out = hi
+  RETURN(0)
+END lw_get_u32
+
+-- ------------------------------------------------------------
+-- SET command with integer argument
+-- ------------------------------------------------------------
+ROUTINE lw_set_int(cmd : STRING; arg_value : INTEGER) : INTEGER
+VAR
+  num_text : STRING[16]
+  reply_buf : STRING[254]
+BEGIN
+  int_str(arg_value, num_text)
+  RETURN(lw_xchg(cmd + ' ' + num_text, reply_buf))
+END lw_set_int
+
+-- ------------------------------------------------------------
+-- SET command with real argument
+-- ------------------------------------------------------------
+ROUTINE lw_set_real(cmd : STRING; arg_value : REAL) : INTEGER
+VAR
+  num_text : STRING[24]
+  reply_buf : STRING[254]
+BEGIN
+  real_str(arg_value, num_text)
+  RETURN(lw_xchg(cmd + ' ' + num_text, reply_buf))
+END lw_set_real
+
+-- ------------------------------------------------------------
+-- SET command with real argument and save = 1 (IPG 2.25 / 2.27:
+-- "If the user provides a value of 1 for the save argument, the
+--  system will preserve the given value in non-volatile memory")
+-- e.g. "SPREF 0.100 1"
+-- ------------------------------------------------------------
+ROUTINE lw_set_real_save(cmd : STRING; arg_value : REAL) : INTEGER
+VAR
+  num_text : STRING[24]
+  reply_buf : STRING[254]
+BEGIN
+  real_str(arg_value, num_text)
+  RETURN(lw_xchg(cmd + ' ' + num_text + ' 1', reply_buf))
+END lw_set_real_save
+
+-- ------------------------------------------------------------
+-- Read a register as INTEGER (real registers are rounded)
+-- Returns the GET_REG status
+-- ------------------------------------------------------------
+ROUTINE get_reg_int(reg_no : INTEGER; value_out : INTEGER) : INTEGER
+VAR
+  is_real  : BOOLEAN
+  int_val  : INTEGER
+  real_val : REAL
+  stat     : INTEGER
+BEGIN
+  GET_REG(reg_no, is_real, int_val, real_val, stat)
+  IF stat = 0 THEN
+    IF is_real THEN
+      value_out = ROUND(real_val)
+    ELSE
+      value_out = int_val
+    ENDIF
+  ENDIF
+  RETURN(stat)
+END get_reg_int
+
+-- ------------------------------------------------------------
+-- TRUE when R[35] = 1 (stop request)
+-- ------------------------------------------------------------
+ROUTINE stop_requested : BOOLEAN
+VAR
+  stop_val : INTEGER
+BEGIN
+  IF get_reg_int(reg_stop, stop_val) <> 0 THEN
+    RETURN(FALSE)
+  ENDIF
+  RETURN(stop_val = 1)
+END stop_requested
+
+-- ============================================================
+-- I/O helpers
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- Read n_bits consecutive flags F[first_flag..] as an unsigned
+-- integer (first flag = LSB), port type io_flag.
+-- Returns 0 or the GET_PORT_VAL status.
+-- ------------------------------------------------------------
+ROUTINE read_group(first_flag : INTEGER; n_bits : INTEGER; value_out : INTEGER) : INTEGER
+VAR
+  bit_no, bit_val, bit_mask, sum, stat : INTEGER
+BEGIN
+  sum = 0
+  bit_mask = 1
+  FOR bit_no = 0 TO n_bits - 1 DO
+    GET_PORT_VAL(io_flag, first_flag + bit_no, bit_val, stat)
+    IF stat <> 0 THEN
+      RETURN(stat)
+    ENDIF
+    IF bit_val <> 0 THEN
+      sum = sum + bit_mask
+    ENDIF
+    bit_mask = bit_mask * 2
+  ENDFOR
+  value_out = sum
+  RETURN(0)
+END read_group
+
+
+-- ------------------------------------------------------------
+-- Limit a value to the 16-bit unsigned range of a DO group
+-- ------------------------------------------------------------
+ROUTINE clamp16(value : INTEGER) : INTEGER
+BEGIN
+  IF value < 0 THEN
+    RETURN(0)
+  ENDIF
+  IF value > 65535 THEN
+    RETURN(65535)
+  ENDIF
+  RETURN(value)
+END clamp16
+
+-- ------------------------------------------------------------
+-- Real laser value -> 16-bit DO value using a scale
+-- ------------------------------------------------------------
+ROUTINE scale_out(value : REAL; scale : REAL) : INTEGER
+BEGIN
+  RETURN(clamp16(ROUND(value / scale)))
+END scale_out
+
+-- ============================================================
+-- Alarm handling
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- The STA alarm word is an unsigned 32-bit value (IPG 2.10).
+-- A KAREL INTEGER is signed (-2147483648 .. +2147483646, A.10.15),
+-- so the word is kept as two 16-bit halves:
+--   sta_lo = bits 0..15,  sta_hi = bits 16..31
+-- ------------------------------------------------------------
+
+-- TRUE when bit bit_no (0..31) is set in the word lo/hi
+ROUTINE u32_bit(lo : INTEGER; hi : INTEGER; bit_no : INTEGER) : BOOLEAN
+VAR
+  bit_mask, n : INTEGER
+BEGIN
+  bit_mask = 1
+  IF bit_no < 16 THEN
+    FOR n = 1 TO bit_no DO
+      bit_mask = bit_mask * 2
+    ENDFOR
+    RETURN((lo AND bit_mask) <> 0)
+  ENDIF
+  FOR n = 1 TO bit_no - 16 DO
+    bit_mask = bit_mask * 2
+  ENDFOR
+  RETURN((hi AND bit_mask) <> 0)
+END u32_bit
+
+-- Lowest active bit number of the alarm word, 0 if no bit is set.
+-- Bit 0 is RESERVED in the STA table, so 0 can safely mean "none".
+ROUTINE alarm_bit(lo : INTEGER; hi : INTEGER) : INTEGER
+VAR
+  bit_no : INTEGER
+BEGIN
+  IF (lo = 0) AND (hi = 0) THEN
+    RETURN(0)
+  ENDIF
+  FOR bit_no = 0 TO 31 DO
+    IF u32_bit(lo, hi, bit_no) THEN
+      RETURN(bit_no)
+    ENDIF
+  ENDFOR
+  RETURN(0)
+END alarm_bit
+
+
+-- ------------------------------------------------------------
+-- STW warning word (U8, IPG 2.11)
+-- ------------------------------------------------------------
+-- Lowest active bit (0..7) of the warning word, -1 if no bit is set
+ROUTINE warn_bit(warn_word : INTEGER) : INTEGER
+VAR
+  bit_no, bit_mask : INTEGER
+BEGIN
+  bit_mask = 1
+  FOR bit_no = 0 TO 7 DO
+    IF (warn_word AND bit_mask) <> 0 THEN
+      RETURN(bit_no)
+    ENDIF
+    bit_mask = bit_mask * 2
+  ENDFOR
+  RETURN(-1)
+END warn_bit
+
+-- ============================================================
+-- Laser -> flags OUT
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- RPROG: check that the laser runs USER program X, index prog_index.
+-- Reply format (IPG 2.18): "RPROG: <program char> <index>".
+-- If the laser runs something else (e.g. changed on the front panel)
+-- sprog_ok is cleared -> ensure_prog sends SPROG and all values again.
+-- ------------------------------------------------------------
+ROUTINE check_prog
+VAR
+  rc         : INTEGER
+  reply_buf  : STRING[254]
+  value_text : STRING[40]
+  prog_char  : STRING[1]
+  idx_text   : STRING[8]
+  prog_idx   : INTEGER
+BEGIN
+  IF NOT sprog_ok THEN
+    RETURN                          -- SPROG not accepted yet, ensure_prog handles it
+  ENDIF
+  rc = lw_xchg('RPROG', reply_buf)
+  IF rc <> 0 THEN
+    RETURN
+  ENDIF
+  lw_value(reply_buf, value_text)   -- e.g. "X 0"
+  IF STR_LEN(value_text) < 3 THEN
+    RETURN
+  ENDIF
+  prog_char = SUB_STR(value_text, 1, 1)
+  idx_text = SUB_STR(value_text, 3, STR_LEN(value_text) - 2)
+  CNV_STR_INT(idx_text, prog_idx)
+  IF UNINIT(prog_idx) THEN
+    RETURN
+  ENDIF
+  IF ((prog_char <> 'X') AND (prog_char <> 'x')) OR (prog_idx <> prog_index) THEN
+    tp_clr
+    WRITE TPERROR('LW: laser runs ', value_text, ', SPROG again', CR)
+    sprog_ok = FALSE
+    sprog_retry = 0
+  ENDIF
+END check_prog
+
+-- ------------------------------------------------------------
+-- Fixed parameters SPREF / SPOSTF / SRMPU / SRMPD.
+-- One parameter per call (round robin): read it back (RPREF, RPOSTF,
+-- RRMPU, RRMPD) and send the constant again when the laser value
+-- differs. A refused SET is reported once and repeated only after
+-- cst_retry_ms. A read that the laser refuses (e.g. RRMPU in a preset
+-- program) is skipped.
+-- ------------------------------------------------------------
+ROUTINE check_const
+VAR
+  rc, int_val : INTEGER
+  real_val    : REAL
+  set_sent    : BOOLEAN
+  par_name    : STRING[8]
+BEGIN
+  cst_idx = cst_idx + 1
+  IF cst_idx > n_cst THEN
+    cst_idx = 1
+  ENDIF
+  IF cst_wait[cst_idx] > 0 THEN
+    cst_wait[cst_idx] = cst_wait[cst_idx] - 1
+    RETURN
+  ENDIF
+
+  set_sent = FALSE
+  rc = 0
+  SELECT cst_idx OF
+    CASE (1):
+      par_name = 'SPREF'
+      IF lw_get_real('RPREF', real_val) = 0 THEN
+        IF ABS(real_val - pref_s) > cst_tol THEN
+          rc = lw_set_real_save('SPREF', pref_s)     -- saved in the laser
+          set_sent = TRUE
+        ENDIF
+      ENDIF
+    CASE (2):
+      par_name = 'SPOSTF'
+      IF lw_get_real('RPOSTF', real_val) = 0 THEN
+        IF ABS(real_val - postf_s) > cst_tol THEN
+          rc = lw_set_real_save('SPOSTF', postf_s)   -- saved in the laser
+          set_sent = TRUE
+        ENDIF
+      ENDIF
+    CASE (3):
+      par_name = 'SRMPU'
+      IF lw_get_int('RRMPU', int_val) = 0 THEN
+        IF int_val <> rmpu_ms THEN
+          rc = lw_set_int('SRMPU', rmpu_ms)
+          set_sent = TRUE
+        ENDIF
+      ENDIF
+    CASE (4):
+      par_name = 'SRMPD'
+      IF lw_get_int('RRMPD', int_val) = 0 THEN
+        IF int_val <> rmpd_ms THEN
+          rc = lw_set_int('SRMPD', rmpd_ms)
+          set_sent = TRUE
+        ENDIF
+      ENDIF
+    ELSE:
+  ENDSELECT
+
+  IF NOT connected THEN
+    RETURN                          -- comm error, handled by lw_xchg
+  ENDIF
+  IF set_sent THEN
+    IF rc = 0 THEN
+      cst_err_shown[cst_idx] = FALSE
+    ELSE
+      cst_wait[cst_idx] = cst_retry_ms DIV (poll_ms * n_cst * n_slow)
+      IF NOT cst_err_shown[cst_idx] THEN
+        tp_clr
+        WRITE TPERROR('LW ', par_name, ': ', last_reply, CR)
+        cst_err_shown[cst_idx] = TRUE
+      ENDIF
+    ENDIF
+  ENDIF
+END check_const
+
+-- ------------------------------------------------------------
+-- Read the laser state and write it to the flags.
+-- Write speed has priority: only ONE read item per main loop cycle,
+-- so every cycle is short and new values from ArcTool (process_inputs,
+-- called every cycle before this routine) reach the laser fast.
+-- Read items in turn (12 steps); STG (Emission ON) every 2nd cycle:
+--    1 STA + STW  alarms / warnings -> F[865], error code, No Gas
+--    3 RPOW       power
+--    5 RWFREQ     wobble frequency
+--    7 RWLEN      wobble width
+--    9 RPROG      laser runs program X 0
+--   11 const      SPREF / SPOSTF / SRMPU / SRMPD (one per visit)
+--   2,4,6,8,10,12 STG  Emission ON (F[866], Process Active)
+-- A comm error closes the connection (lw_xchg).
+-- A laser ERROR reply (e.g. RWLEN in a preset program) keeps
+-- the last flag value.
+-- ------------------------------------------------------------
+ROUTINE poll_status
+VAR
+  rc      : INTEGER
+  int_val : INTEGER
+  real_val : REAL
+  sta_lo  : INTEGER
+  sta_hi  : INTEGER
+  warn_no : INTEGER
+BEGIN
+  slow_idx = slow_idx + 1
+  IF slow_idx > n_slow THEN
+    slow_idx = 1
+  ENDIF
+
+  SELECT slow_idx OF
+    CASE (1):
+      -- STA: U32 alarm word -> F[865] (inverted), error code
+      -- STW: U8 warning word -> No Gas, error code when no alarm
+      rc = lw_get_u32('STA', sta_lo, sta_hi)
+      IF rc = 0 THEN
+        sta_bad_shown = FALSE
+        g_sta_lo = sta_lo
+        g_sta_hi = sta_hi
+        IF (sta_lo <> 0) OR (sta_hi <> 0) THEN
+          write_group(out_error, fo_error, 1, 0)
+          sta_code = alarm_bit(sta_lo, sta_hi)
+        ELSE
+          write_group(out_error, fo_error, 1, 1)
+          sta_code = 0
+        ENDIF
+      ELSE
+        IF (rc = -4) AND (NOT sta_bad_shown) THEN
+          tp_clr
+          WRITE TPERROR('LW STA bad reply: ', last_reply, CR)
+          sta_bad_shown = TRUE
+        ENDIF
+      ENDIF
+      IF connected THEN
+        IF lw_get_int('STW', int_val) = 0 THEN
+          no_gas = ((int_val AND 1) <> 0)   -- bit 0 No Gas
+          g_stw = int_val
+          warn_no = warn_bit(int_val)
+          IF warn_no < 0 THEN
+            stw_code = 0
+          ELSE
+            stw_code = warn_ofs + warn_no
+          ENDIF
+        ENDIF
+      ENDIF
+
+    CASE (2, 4, 6, 8, 10, 12):
+      -- STG: general status, bit 2 = Emission ON (every 2nd cycle)
+      IF lw_get_int('STG', int_val) = 0 THEN
+        emis_on = ((int_val AND 4) <> 0)    -- used for Process Active
+        ilock_ok = ((int_val AND 1) <> 0)   -- bit 0 Interlocks OK (error 32)
+        IF emis_on THEN
+          write_group(out_emis, fo_emission, 1, 1)
+        ELSE
+          write_group(out_emis, fo_emission, 1, 0)
+        ENDIF
+      ENDIF
+
+    CASE (3):
+      -- RPOW: power setpoint [W]
+      IF lw_get_int('RPOW', int_val) = 0 THEN
+        real_val = int_val                  -- explicit INTEGER -> REAL
+        write_group(out_power, fo_power, 16, scale_out(real_val, power_scale))
+      ENDIF
+
+    CASE (5):
+      -- RWFREQ: wobble frequency [Hz] (user programs only)
+      IF lw_get_real('RWFREQ', real_val) = 0 THEN
+        write_group(out_wfreq, fo_wfreq, 16, scale_out(real_val, wfreq_scale))
+      ENDIF
+
+    CASE (7):
+      -- RWLEN: wobble length [mm] (user programs only)
+      IF lw_get_real('RWLEN', real_val) = 0 THEN
+        write_group(out_wlen, fo_wlen, 16, scale_out(real_val, wlen_scale))
+      ENDIF
+
+    CASE (9):
+      -- RPROG: laser must run USER program X, index prog_index
+      check_prog
+
+    CASE (11):
+      -- fixed parameters SPREF / SPOSTF / SRMPU / SRMPD, one per visit
+      check_const
+
+    ELSE:
+  ENDSELECT
+END poll_status
+
+-- ============================================================
+-- Flags IN -> laser
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- Send one input channel to the laser. Returns lw_xchg result.
+-- ------------------------------------------------------------
+ROUTINE send_input(in_idx : INTEGER; raw : INTEGER) : INTEGER
+BEGIN
+  SELECT in_idx OF
+    CASE (in_mat):
+      RETURN(lw_set_int('SMAT', raw))         -- raw is already 0 / 1
+    CASE (in_power):
+      RETURN(lw_set_int('SPOW', ROUND(raw * power_scale)))
+    CASE (in_wfreq):
+      RETURN(lw_set_real('SWFREQ', raw * wfreq_scale))
+    CASE (in_wlen):
+      RETURN(lw_set_real('SWLEN', raw * wlen_scale))
+    CASE (in_comp):
+      RETURN(lw_set_real('SPCF', raw * comp_scale))
+    ELSE:
+      RETURN(-3)
+  ENDSELECT
+  RETURN(-3)
+END send_input
+
+-- ------------------------------------------------------------
+-- Make sure the laser runs USER program X, index prog_index.
+-- On success all values are sent again (index settings belong to
+-- the active index). A refused SPROG is reported and retried
+-- every sprog_retry_ms.
+-- ------------------------------------------------------------
+ROUTINE ensure_prog
+VAR
+  rc, idx   : INTEGER
+  num_text  : STRING[8]
+  reply_buf : STRING[254]
+BEGIN
+  IF sprog_ok THEN
+    RETURN
+  ENDIF
+  IF sprog_retry > 0 THEN
+    sprog_retry = sprog_retry - 1
+    RETURN
+  ENDIF
+  int_str(prog_index, num_text)
+  rc = lw_xchg('SPROG X ' + num_text, reply_buf)
+  IF NOT connected THEN
+    RETURN                          -- comm error, retried after reconnect
+  ENDIF
+  IF rc = 0 THEN
+    sprog_ok = TRUE
+    FOR idx = 1 TO n_in DO
+      in_sent[idx] = -1
+    ENDFOR
+  ELSE
+    sprog_retry = sprog_retry_ms DIV poll_ms
+    IF STR_LEN(last_reply) > 0 THEN
+      tp_clr
+      WRITE TPERROR('LW ', last_reply, CR)
+    ELSE
+      tp_clr
+      WRITE TPERROR('LW: SPROG X ', num_text, ' failed, rc ', rc::1, CR)
+    ENDIF
+  ENDIF
+END ensure_prog
+
+-- ------------------------------------------------------------
+-- Read all input groups and send changed values:
+--   power / wobble frequency / wobble width at once,
+--   Process Select (SMAT) / compensation when stable for 2 scans.
+-- A failed SET is reported once and not repeated until the flag
+-- value changes again.
+-- ------------------------------------------------------------
+ROUTINE process_inputs
+VAR
+  in_idx, raw, stat, rc : INTEGER
+  direct : BOOLEAN
+BEGIN
+  ensure_prog                          -- SPROG X 0 first
+  IF NOT connected THEN
+    RETURN
+  ENDIF
+  FOR in_idx = 1 TO n_in DO
+    stat = read_group(in_port[in_idx], in_bits[in_idx], raw)
+    IF (stat = 0) AND (in_idx = in_mat) THEN
+      raw = raw MOD 2                  -- only even / odd matters
+    ENDIF
+    IF stat <> 0 THEN
+      IF NOT in_err_shown[in_idx] THEN
+        tp_clr
+        WRITE TPERROR('LW: F[', in_port[in_idx]::1, '] read status ', stat::1, CR)
+        in_err_shown[in_idx] = TRUE
+      ENDIF
+    ELSE
+      -- power, wobble frequency and wobble width are sent at once on
+      -- every change (ArcTool ramps them); material and compensation
+      -- only when the value is stable for 2 scans
+      direct = (in_idx = in_power) OR (in_idx = in_wfreq) OR (in_idx = in_wlen)
+      IF (raw <> in_sent[in_idx]) AND (direct OR (raw = in_prev[in_idx])) THEN
+        rc = send_input(in_idx, raw)
+        IF NOT connected THEN
+          RETURN                       -- comm error, value is sent again after reconnect
+        ENDIF
+        in_sent[in_idx] = raw
+        IF rc <> 0 THEN
+          -- message line: laser reply text, USER screen: full detail
+          IF STR_LEN(last_reply) > 0 THEN
+            tp_clr
+            WRITE TPERROR('LW ', last_reply, CR)
+          ELSE
+            tp_clr
+            WRITE TPERROR('LW: set ch ', in_idx::1, ' = ', raw::1, ' failed, rc ', rc::1, CR)
+          ENDIF
+          WRITE TPDISPLAY('LW set ch ', in_idx::1, ' = ', raw::1, ' rc ', rc::1, CR)
+          WRITE TPDISPLAY(' sent:  ', last_cmd, CR)
+          WRITE TPDISPLAY(' reply: ', last_reply, CR)
+        ELSE
+          in_err_shown[in_idx] = FALSE
+        ENDIF
+      ENDIF
+      in_prev[in_idx] = raw
+    ENDIF
+  ENDFOR
+END process_inputs
+
+-- ------------------------------------------------------------
+-- Process Active F[867] = Trigger 1 (F[705]) AND Emission ON (STG
+-- bit 2) AND NOT No Gas (STW bit 0). 0 when the laser is not
+-- connected. Evaluated every main loop cycle.
+-- ------------------------------------------------------------
+-- Swap the two bytes of a 16-bit value (eBOX byte order)
+-- ------------------------------------------------------------
+ROUTINE swap16(value : INTEGER) : INTEGER
+BEGIN
+  RETURN((value MOD 256) * 256 + ((value DIV 256) MOD 256))
+END swap16
+
+-- ------------------------------------------------------------
+-- Write value to n_bits flags F[first_flag..] (first = LSB).
+-- Returns 0 or the first SET_PORT_VAL status.
+-- ------------------------------------------------------------
+ROUTINE set_flags(first_flag : INTEGER; n_bits : INTEGER; value : INTEGER) : INTEGER
+VAR
+  bit_no, work_val, stat, rc : INTEGER
+BEGIN
+  rc = 0
+  work_val = value
+  FOR bit_no = 0 TO n_bits - 1 DO
+    SET_PORT_VAL(io_flag, first_flag + bit_no, work_val MOD 2, stat)
+    IF (stat <> 0) AND (rc = 0) THEN
+      rc = stat
+    ENDIF
+    work_val = work_val DIV 2
+  ENDFOR
+  RETURN(rc)
+END set_flags
+
+-- ------------------------------------------------------------
+-- Read one DI, -1 when it cannot be read (reported once)
+-- ------------------------------------------------------------
+ROUTINE ebox_di(port_no : INTEGER) : INTEGER
+VAR
+  bit_val, stat : INTEGER
+BEGIN
+  GET_PORT_VAL(io_din, port_no, bit_val, stat)
+  IF stat <> 0 THEN
+    IF NOT ebox_err_shown THEN
+      tp_clr
+      WRITE TPERROR('LW eBOX: DI[', port_no::1, '] read status ', stat::1, CR)
+      ebox_err_shown = TRUE
+    ENDIF
+    RETURN(-1)
+  ENDIF
+  RETURN(bit_val)
+END ebox_di
+
+-- ------------------------------------------------------------
+-- Write DO[267] eBOX Start Forward (only on change)
+-- ------------------------------------------------------------
+ROUTINE ebox_fwd(value : INTEGER)
+VAR
+  stat : INTEGER
+BEGIN
+  IF value <> ebox_fwd_last THEN
+    SET_PORT_VAL(io_dout, do_ebox_fwd, value, stat)
+    IF stat = 0 THEN
+      ebox_fwd_last = value
+    ENDIF
+  ENDIF
+END ebox_fwd
+
+-- ------------------------------------------------------------
+-- Write one eBOX DO (only on change). last_val is the variable that
+-- holds the last written value of this DO (passed by reference).
+-- ------------------------------------------------------------
+ROUTINE ebox_do(do_no : INTEGER; value : INTEGER; last_val : INTEGER)
+VAR
+  stat : INTEGER
+BEGIN
+  IF value <> last_val THEN
+    SET_PORT_VAL(io_dout, do_no, value, stat)
+    IF stat = 0 THEN
+      last_val = value
+    ENDIF
+  ENDIF
+END ebox_do
+
+-- ------------------------------------------------------------
+-- Copy one flag to one eBOX DO (only on change)
+-- ------------------------------------------------------------
+ROUTINE ebox_copy(src_flag : INTEGER; do_no : INTEGER; last_val : INTEGER)
+VAR
+  bit_val, stat : INTEGER
+BEGIN
+  GET_PORT_VAL(io_flag, src_flag, bit_val, stat)
+  IF stat = 0 THEN
+    IF bit_val <> 0 THEN
+      ebox_do(do_no, 1, last_val)
+    ELSE
+      ebox_do(do_no, 0, last_val)
+    ENDIF
+  ENDIF
+END ebox_copy
+
+-- ------------------------------------------------------------
+-- Write DO[266] eBOX Error Reset (only on change)
+-- ------------------------------------------------------------
+ROUTINE ebox_rst(value : INTEGER)
+VAR
+  stat : INTEGER
+BEGIN
+  IF value <> ebox_rst_last THEN
+    SET_PORT_VAL(io_dout, do_ebox_rst, value, stat)
+    IF stat = 0 THEN
+      ebox_rst_last = value
+    ENDIF
+  ENDIF
+END ebox_rst
+
+-- ------------------------------------------------------------
+-- Write DO[265] eBOX Process Release (only on change)
+-- ------------------------------------------------------------
+ROUTINE ebox_rel(value : INTEGER)
+VAR
+  stat : INTEGER
+BEGIN
+  IF value <> ebox_rel_last THEN
+    SET_PORT_VAL(io_dout, do_ebox_rel, value, stat)
+    IF stat = 0 THEN
+      ebox_rel_last = value
+    ENDIF
+  ENDIF
+END ebox_rel
+
+-- ------------------------------------------------------------
+-- eBOX wire feeder, called every main loop cycle.
+-- Active only while Process Select (F[713-715]) = 2 or 3:
+--   * DO[286] and DO[288] (Op Mode W1, W3) = TRUE
+--   * DI[266] eBOX No Error -> F[946] (1 = OK)
+--   * eBOX error code (first one found):
+--       51 DI[273] = 0          Control cable disconnected
+--       52 DI[274] = 0          eBox internal fault
+--       53 DI[285] = 0          eBox key not in auto
+--       54 DI[286] = 0 or DI[287] = 1 or DI[288] = 0
+--                               eBox mode select error
+--   * F[849-864] WFS -> swap bytes -> GO[31]
+--   * GI[31] -> swap bytes -> F[1009-1024] WFS
+--   * error reset F[708] (same as RERR for the laser) -> DO[266]
+--   * Trigger 1 F[705] OR TPIN[174] OR TPIN[175] OR TPIN[180] OR
+--     TPIN[181] -> DO[265] Process Release; DI[265] System Ready
+--     not ON within ebox_rel_tmo -> error 55
+--   * F[787] Start Forward -> DO[267], F[788] Inching -> DO[268],
+--     F[789] Start Backward -> DO[269]
+-- Process Select not 2 / 3 (eBOX not used): F[946] = 1 (no error);
+-- when it becomes inactive: DO[286], DO[288] and GO[31] = 0,
+-- eBOX errors cleared; F[1009-1024] is left as is.
+-- ------------------------------------------------------------
+ROUTINE ebox_io
+VAR
+  psel, stat, val, code, wfs : INTEGER
+  m1, m2, m3 : INTEGER
+BEGIN
+  stat = read_group(fi_psel, 3, psel)
+  IF stat <> 0 THEN
+    RETURN                          -- keep the last state
+  ENDIF
+
+  IF (psel <> ebox_psel_a) AND (psel <> ebox_psel_b) THEN
+    IF ebox_on THEN
+      SET_PORT_VAL(io_dout, do_ebox_w1, 0, stat)
+      SET_PORT_VAL(io_dout, do_ebox_w3, 0, stat)
+      SET_PORT_VAL(io_gpout, go_ebox_wfs, 0, stat)
+      ebox_fwd(0)                   -- Start Forward off
+      ebox_do(do_ebox_inch, 0, ebox_inch_last)   -- Inching off
+      ebox_do(do_ebox_bwd, 0, ebox_bwd_last)     -- Start Backward off
+      ebox_rst(0)                   -- Error Reset off
+      ebox_rel(0)                   -- Process Release off
+      ebox_on = FALSE
+    ENDIF
+    ebox_code = 0
+    ebox_err55 = FALSE
+    FOR val = 1 TO 4 DO
+      ebox_err[val] = FALSE
+    ENDFOR
+    -- eBOX not used: F[946] eBOX No Error = 1 (everything OK)
+    IF ebox_ok_last <> 1 THEN
+      IF set_flags(fo_ebox_ok, 1, 1) = 0 THEN
+        ebox_ok_last = 1
+      ENDIF
+    ENDIF
+    ebox_go_last = -1
+    ebox_fo_last = -1
+    RETURN
+  ENDIF
+
+  -- ---- eBOX active ----
+  IF NOT ebox_on THEN
+    SET_PORT_VAL(io_dout, do_ebox_w1, 1, stat)
+    SET_PORT_VAL(io_dout, do_ebox_w3, 1, stat)
+    ebox_on = TRUE
+  ENDIF
+
+  -- summary error: DI[266] -> F[946]
+  val = ebox_di(di_ebox_ok)
+  IF (val >= 0) AND (val <> ebox_ok_last) THEN
+    IF set_flags(fo_ebox_ok, 1, val) = 0 THEN
+      ebox_ok_last = val
+    ENDIF
+  ENDIF
+
+  -- eBOX errors 51..54 (all of them, for the error list)
+  ebox_err[1] = (ebox_di(di_ebox_cbl) = 0)        -- 51
+  ebox_err[2] = (ebox_di(di_ebox_mot) = 0)        -- 52
+  ebox_err[3] = (ebox_di(di_ebox_key) = 0)        -- 53
+  m1 = ebox_di(di_ebox_m1)
+  m2 = ebox_di(di_ebox_m2)
+  m3 = ebox_di(di_ebox_m3)
+  ebox_err[4] = (m1 = 0) OR (m2 = 1) OR (m3 = 0)  -- 54
+  code = 0
+  FOR val = 4 DOWNTO 1 DO
+    IF ebox_err[val] THEN
+      code = err_ebox_cbl + val - 1
+    ENDIF
+  ENDFOR
+  ebox_code = code                  -- first eBOX error (info only)
+
+  -- process release DO[265] = Trigger 1 (F[705])
+  --   OR TPIN[174] USER KEY 2  OR TPIN[175] USER KEY 3
+  --   OR TPIN[180] Shifted USER KEY 2  OR TPIN[181] Shifted USER KEY 3
+  --   (teach pendant keys, B-83144EN-1/02 table 11.2.3)
+  -- release ON and DI[265] System Ready not ON within ebox_rel_tmo
+  -- -> error 55 (stays while the release is ON and DI[265] is OFF)
+  IF trig1_on OR TPIN[174] OR TPIN[175] OR TPIN[180] OR TPIN[181] THEN
+    IF ebox_rel_last <> 1 THEN
+      ebox_rel_t0 = clock_ms        -- release goes ON now
+    ENDIF
+    ebox_rel(1)
+    IF ebox_di(di_ebox_rdy) = 1 THEN
+      ebox_err55 = FALSE
+    ELSE
+      IF (clock_ms - ebox_rel_t0) > ebox_rel_tmo THEN
+        ebox_err55 = TRUE
+      ENDIF
+    ENDIF
+  ELSE
+    ebox_rel(0)
+    ebox_err55 = FALSE
+  ENDIF
+
+  -- error reset: the same signal as the laser reset (F[708]) -> DO[266]
+  GET_PORT_VAL(io_flag, fi_reset, val, stat)
+  IF stat = 0 THEN
+    IF val <> 0 THEN
+      ebox_rst(1)
+    ELSE
+      ebox_rst(0)
+    ENDIF
+  ENDIF
+
+  -- wire feed: F[787] Start Forward -> DO[267]
+  GET_PORT_VAL(io_flag, fi_ebox_fwd, val, stat)
+  IF stat = 0 THEN
+    IF val <> 0 THEN
+      ebox_fwd(1)
+    ELSE
+      ebox_fwd(0)
+    ENDIF
+  ENDIF
+  -- F[788] Inching -> DO[268], F[789] Start Backward -> DO[269]
+  ebox_copy(fi_ebox_inch, do_ebox_inch, ebox_inch_last)
+  ebox_copy(fi_ebox_bwd, do_ebox_bwd, ebox_bwd_last)
+
+  -- WFS ArcTool -> eBOX: F[849-864] -> swap -> GO[31]
+  IF read_group(fi_ebox_wfs, 16, wfs) = 0 THEN
+    val = swap16(wfs)
+    IF val <> ebox_go_last THEN
+      SET_PORT_VAL(io_gpout, go_ebox_wfs, val, stat)
+      IF stat = 0 THEN
+        ebox_go_last = val
+      ELSE
+        IF NOT ebox_err_shown THEN
+          tp_clr
+          WRITE TPERROR('LW eBOX: GO[', go_ebox_wfs::1, '] write status ', stat::1, CR)
+          ebox_err_shown = TRUE
+        ENDIF
+      ENDIF
+    ENDIF
+  ENDIF
+
+  -- WFS eBOX -> ArcTool: GI[31] -> swap -> F[1009-1024]
+  GET_PORT_VAL(io_gpin, gi_ebox_wfs, wfs, stat)
+  IF stat = 0 THEN
+    val = swap16(wfs)
+    IF val <> ebox_fo_last THEN
+      IF set_flags(fo_ebox_wfs, 16, val) = 0 THEN
+        ebox_fo_last = val
+      ENDIF
+    ENDIF
+  ELSE
+    IF NOT ebox_err_shown THEN
+      tp_clr
+      WRITE TPERROR('LW eBOX: GI[', gi_ebox_wfs::1, '] read status ', stat::1, CR)
+      ebox_err_shown = TRUE
+    ENDIF
+  ENDIF
+END ebox_io
+
+-- ------------------------------------------------------------
+-- Wait settle_ms after a (re)connect before talking to the laser
+-- (the laser hangs when it gets commands right after the connect).
+-- Same as DELAY settle_ms, but in wait_ms steps so that the trigger /
+-- nozzle mirror and the eBOX keep working and R[35] = 1 still stops
+-- the driver during the wait.
+-- ------------------------------------------------------------
+ROUTINE settle_wait
+VAR
+  step : INTEGER
+BEGIN
+  FOR step = 1 TO settle_ms DIV wait_ms DO
+    DELAY wait_ms
+    trig_mirror
+    ebox_io
+    IF stop_requested THEN
+      RETURN
+    ENDIF
+  ENDFOR
+END settle_wait
+
+-- ------------------------------------------------------------
+-- Build the list of all active errors, in this order:
+--   1..31    STA alarm bits of the laser (ascending)
+--   32       Interlocks OK (STG bit 0) OFF and Trigger 2 (F[706]) ON
+--   200      no connection to the laser
+--   100..107 STW warning bits of the laser (ascending)
+--   51..54   eBOX errors (only while the eBOX is active)
+-- ------------------------------------------------------------
+ROUTINE add_err(code : INTEGER)
+BEGIN
+  IF cur_n < max_err THEN
+    cur_n = cur_n + 1
+    cur_list[cur_n] = code
+  ENDIF
+END add_err
+
+ROUTINE collect_errors
+VAR
+  bit_no, bit_mask : INTEGER
+BEGIN
+  cur_n = 0
+  IF connected THEN
+    FOR bit_no = 1 TO 31 DO
+      IF u32_bit(g_sta_lo, g_sta_hi, bit_no) THEN
+        add_err(bit_no)
+      ENDIF
+    ENDFOR
+    IF (NOT ilock_ok) AND trig2_on THEN
+      add_err(err_ilock)
+    ENDIF
+  ENDIF
+  IF las_nc THEN
+    add_err(err_no_conn)
+  ENDIF
+  IF connected THEN
+    bit_mask = 1
+    FOR bit_no = 0 TO 7 DO
+      IF (g_stw AND bit_mask) <> 0 THEN
+        add_err(warn_ofs + bit_no)
+      ENDIF
+      bit_mask = bit_mask * 2
+    ENDFOR
+  ENDIF
+  FOR bit_no = 1 TO 4 DO
+    IF ebox_err[bit_no] THEN
+      add_err(err_ebox_cbl + bit_no - 1)
+    ENDIF
+  ENDFOR
+  IF ebox_err55 THEN
+    add_err(err_ebox_rel)
+  ENDIF
+END collect_errors
+
+-- ------------------------------------------------------------
+-- IPG Error code F[929-944]:
+--   * no error latched: the errors are searched every cycle in the
+--     order of collect_errors; no error -> 0; the FIRST error found is
+--     written and latched, the search stops
+--   * latched: the code stays, nothing else is written
+--   * error reset F[708] (rising edge): the latch is released and the
+--     search starts again from the beginning
+-- ------------------------------------------------------------
+ROUTINE update_errcode
+BEGIN
+  IF err_reset_req THEN
+    err_reset_req = FALSE
+    err_latched = FALSE             -- search again from the beginning
+  ENDIF
+  IF err_latched THEN
+    RETURN                          -- wait for the reset
+  ENDIF
+
+  collect_errors
+  IF cur_n = 0 THEN
+    write_group(out_errcode, fo_errcode, 16, 0)
+  ELSE
+    write_group(out_errcode, fo_errcode, 16, cur_list[1])
+    err_latched = TRUE
+  ENDIF
+END update_errcode
+
+-- ------------------------------------------------------------
+ROUTINE update_pactive
+BEGIN
+  IF connected AND trig1_on AND emis_on AND (NOT no_gas) THEN
+    write_group(out_pactive, fo_pactive, 1, 1)
+  ELSE
+    write_group(out_pactive, fo_pactive, 1, 0)
+  ENDIF
+END update_pactive
+
+-- ------------------------------------------------------------
+-- Error reset: F[708] rising edge (0 -> 1) sends RERR (IPG 2.16).
+-- RERR clears only alarms whose cause is gone; alarms marked
+-- "Clearable = NO" in the STA table need a power cycle of the laser.
+-- The result is visible on F[865] / F[929-944] after the next poll.
+-- An edge while the laser is not connected is ignored.
+-- Nothing is displayed on the TP.
+-- ------------------------------------------------------------
+ROUTINE check_reset
+VAR
+  bit_val, stat, rc : INTEGER
+  reply_buf : STRING[254]
+BEGIN
+  GET_PORT_VAL(io_flag, fi_reset, bit_val, stat)
+  IF stat <> 0 THEN
+    RETURN                          -- flag not readable, try again next cycle
+  ENDIF
+  IF (bit_val <> 0) AND (rst_last = 0) THEN
+    err_reset_req = TRUE            -- restart the error code sequence
+    IF connected THEN
+      rc = lw_xchg('RERR', reply_buf) -- result not displayed
+    ENDIF
+  ENDIF
+  rst_last = bit_val
+END check_reset
+
+-- ------------------------------------------------------------
+-- Controller ready check: no connection attempt until the system
+-- variable $PWRUP_DELAY.$SY_READY is TRUE (power-up finished).
+-- Read with GET_VAR (A.8.31), prog_name '*SYSTEM*'. Once TRUE the
+-- result is kept, the variable is not read again.
+-- ------------------------------------------------------------
+ROUTINE check_sys_ready
+VAR
+  stat : INTEGER
+BEGIN
+  IF sys_ready THEN
+    RETURN
+  ENDIF
+  GET_VAR(sys_rdy_entry, '*SYSTEM*', '$PWRUP_DELAY.$SY_READY', sys_rdy_val, stat)
+  IF stat <> 0 THEN
+    IF NOT sys_rdy_err THEN
+      tp_clr
+      WRITE TPERROR('LW: $PWRUP_DELAY.$SY_READY status ', stat::1, CR)
+      POST_ERR(stat, '', 0, 0)      -- system text as WARNING
+      sys_rdy_err = TRUE
+    ENDIF
+    RETURN
+  ENDIF
+  IF sys_rdy_val THEN
+    sys_ready = TRUE
+    tp_clr
+    WRITE TPERROR('LW: system ready, connecting', CR)
+  ENDIF
+END check_sys_ready
+
+-- ------------------------------------------------------------
+-- Force every input to be sent again (after a (re)connect)
+-- ------------------------------------------------------------
+ROUTINE resend_all
+VAR
+  idx : INTEGER
+BEGIN
+  FOR idx = 1 TO n_in DO
+    in_sent[idx] = -1
+  ENDFOR
+  sta_bad_shown = FALSE
+  sprog_ok = FALSE
+  sprog_retry = 0
+  FOR idx = 1 TO n_cst DO
+    cst_wait[idx] = 0               -- check all fixed parameters again
+  ENDFOR
+END resend_all
+
+-- ============================================================
+-- MAIN: background loop
+-- ============================================================
+BEGIN
+  client_tag = 'C3:'
+  clock_ms = 0
+  CONNECT TIMER TO clock_ms         -- ms clock: eBOX release timeout, nozzle break
+
+  -- DELAY: "The actual delay will be from zero to $SCR.$cond_time
+  -- milliseconds less than the rounded time" (A.5.11). A DELAY shorter
+  -- than 2 x $COND_TIME can therefore be 0 ms - the task would never
+  -- give up the CPU while waiting for the laser and the teach pendant
+  -- (TP manager, priority 88, table 12.3.1) would freeze.
+  -- So every DELAY of this driver is at least 2 x $COND_TIME.
+  cond_entry = 0
+  GET_VAR(cond_entry, '*SYSTEM*', '$SCR.$COND_TIME', cond_time, karel_stat)
+  IF (karel_stat <> 0) OR (cond_time <= 0) THEN
+    cond_time = 10                  -- not readable: safe default
+  ENDIF
+  wait_ms = rx_poll_ms
+  IF wait_ms < 2 * cond_time THEN
+    wait_ms = 2 * cond_time
+  ENDIF
+  loop_ms = poll_ms
+  IF loop_ms < wait_ms THEN
+    loop_ms = wait_ms
+  ENDIF
+  reconnect_cur = reconnect_ms
+  cur_prio = -1
+  set_prio(prio_offline)            -- until the laser answers
+  connected = FALSE
+  file_open = FALSE
+  stop_req = FALSE
+  retry_count = 0
+  sys_ready = FALSE
+  sys_rdy_entry = 0
+  sys_rdy_err = FALSE
+  no_conn_shown = FALSE
+  laser_host = 'IPG'               -- name in the Host Name table
+  detail_code = 0
+  sta_bad_shown = FALSE
+  sprog_ok = FALSE
+  sprog_retry = 0
+  trig_src[1] = trig1_src
+  trig_do[1]  = do_trig1
+  trig_src[2] = trig2_src
+  trig_do[2]  = do_trig2
+  FOR init_idx = 1 TO 2 DO
+    trig_last[init_idx] = -1
+    trig_err[init_idx] = FALSE
+  ENDFOR
+  noz_last = -1
+  noz_err = FALSE
+  trig1_prev = FALSE
+  noz_break = FALSE
+  noz_break_t0 = 0
+  slow_idx = 0
+  sta_code = 0
+  stw_code = 0
+  las_nc = FALSE
+  ebox_code = 0
+  FOR init_idx = 1 TO 4 DO
+    ebox_err[init_idx] = FALSE
+  ENDFOR
+  g_sta_lo = 0
+  g_sta_hi = 0
+  g_stw = 0
+  ilock_ok = TRUE
+  trig2_on = FALSE
+  cur_n = 0
+  err_latched = FALSE
+  err_reset_req = FALSE
+  ebox_on = FALSE
+  ebox_ok_last = -1
+  ebox_go_last = -1
+  ebox_fo_last = -1
+  ebox_fwd_last = -1
+  ebox_inch_last = -1
+  ebox_bwd_last = -1
+  ebox_rst_last = -1
+  ebox_rel_last = -1
+  ebox_rel_t0 = 0
+  ebox_err55 = FALSE
+  ebox_err_shown = FALSE
+  trig1_on = FALSE
+  emis_on = FALSE
+  no_gas = FALSE
+  rst_last = -1                     -- no reset if F[708] is already ON at start
+
+  cst_idx = 0
+  FOR init_idx = 1 TO n_cst DO
+    cst_wait[init_idx] = 0
+    cst_err_shown[init_idx] = FALSE
+  ENDFOR
+
+  in_port[in_mat]   = fi_psel
+  in_bits[in_mat]   = 3
+  in_port[in_power] = fi_power
+  in_bits[in_power] = 16
+  in_port[in_wfreq] = fi_wfreq
+  in_bits[in_wfreq] = 16
+  in_port[in_wlen]  = fi_wlen
+  in_bits[in_wlen]  = 16
+  in_port[in_comp]  = fi_comp
+  in_bits[in_comp]  = 16
+
+  FOR init_idx = 1 TO n_in DO
+    in_prev[init_idx] = -1
+    in_sent[init_idx] = -1
+    in_err_shown[init_idx] = FALSE
+  ENDFOR
+  FOR init_idx = 1 TO n_out DO
+    out_last[init_idx] = -1
+    out_err_shown[init_idx] = FALSE
+  ENDFOR
+
+  -- a previous instance may have left the tag connected
+  MSG_DISCO(client_tag, karel_stat)
+  -- no outputs_disconnected here: the error code 200 is written only
+  -- when the first connection attempt really fails (main loop)
+
+  tp_clr
+  WRITE TPERROR('LW: started, waiting for $PWRUP_DELAY.$SY_READY', CR)
+
+  WHILE NOT stop_req DO
+    trig_mirror                     -- triggers work with or without laser connection
+
+    -- automatic connect / reconnect, only after power-up is finished
+    check_sys_ready
+    IF (NOT connected) AND sys_ready THEN
+      IF retry_count <= 0 THEN
+        IF file_open THEN
+          -- socket still open, laser was silent: probe it with STA
+          -- (lw_xchg sets connected = FALSE again on no answer)
+          connected = TRUE
+          karel_stat = lw_xchg('STA', probe_reply)
+          IF connected THEN
+            las_nc = FALSE
+            no_conn_shown = FALSE
+            resend_all
+            tp_clr
+            WRITE TPERROR('LW: laser answers again', CR)
+          ENDIF
+        ELSE
+          karel_stat = lw_connect
+          IF karel_stat = 0 THEN
+            connected = TRUE
+            las_nc = FALSE
+            no_conn_shown = FALSE
+            resend_all
+            tp_clr
+            WRITE TPERROR('LW: connected', CR)
+            settle_wait             -- let the laser settle (settle_ms)
+          ELSE
+            detail_code = karel_stat
+            next_attempt            -- 2 s, 4 s, 8 s ... up to 30 s
+          ENDIF
+        ENDIF
+      ELSE
+        retry_count = retry_count - 1
+      ENDIF
+    ENDIF
+
+    check_reset                     -- F[708] rising edge -> RERR
+    IF connected THEN
+      process_inputs
+    ENDIF
+    IF connected THEN
+      poll_status
+    ENDIF
+    IF NOT connected THEN
+      IF sys_ready AND (NOT no_conn_shown) THEN
+        tp_clr
+        WRITE TPERROR('LW: no connection, status ', detail_code::1, CR)
+        IF detail_code > 0 THEN
+          -- show the system text of the status (e.g. 67176 = HOST-176)
+          -- in the alarm line / history as WARNING (A.17.14 POST_ERR)
+          POST_ERR(detail_code, '', 0, 0)
+        ENDIF
+        no_conn_shown = TRUE
+      ENDIF
+      set_prio(prio_offline)
+      outputs_disconnected
+    ENDIF
+    ebox_io                         -- eBOX wire feeder (Process Select 2 / 3)
+    update_errcode                  -- F[929-944] IPG Error code
+    update_pactive                  -- F[867] Process Active
+
+    DELAY loop_ms                   -- >= wait_ms, always a real pause
+    stop_req = stop_requested
+  ENDWHILE
+
+  lw_close
+  outputs_disconnected
+  trig_off
+  IF ebox_on THEN                   -- driver stop: eBOX outputs off
+    SET_PORT_VAL(io_dout, do_ebox_w1, 0, karel_stat)
+    SET_PORT_VAL(io_dout, do_ebox_w3, 0, karel_stat)
+    SET_PORT_VAL(io_gpout, go_ebox_wfs, 0, karel_stat)
+    ebox_fwd(0)
+    ebox_do(do_ebox_inch, 0, ebox_inch_last)
+    ebox_do(do_ebox_bwd, 0, ebox_bwd_last)
+    ebox_rst(0)
+    ebox_rel(0)
+  ENDIF
+END lightweld

@@ -1,0 +1,21 @@
+-- Builtin function. DO NOT MODIFY
+function sleep(time) for i = 0, time / 100, 1 do sleep_100() end end
+function DoNothing() end
+
+--Checks position in X axis, used to determine wether robot moved too far along the conveyor
+--MUST Always run for safety reasons
+estop_status = 0
+
+while(true) do
+set_value("g_ConvBase_X_Pos",get_tcp_pose_coord("Screwdriver","ConvBase2")[1])
+
+
+estop_status = get_safety_state()
+if estop_status == 8 or estop_status == 9 then
+    write_reg(5,1,true) --Pendant EStop
+else
+    write_reg(5,1,false) --Pendant EStop
+end
+
+sleep(200)
+end
