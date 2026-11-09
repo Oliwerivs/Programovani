@@ -1,0 +1,54 @@
+-- Builtin function. DO NOT MODIFY
+function sleep(time) for i = 0, time / 100, 1 do sleep_100() end end
+function DoNothing() end
+
+while true do
+
+    if get_value("g_FIFO_Init") then
+        set_value("g_FIFO_Index", 1)
+        set_value("g_FIFO_queue", {0, 0, 0, 0, 0, 0})
+        set_value("g_FIFO_Zapis", false)
+        set_value("g_FIFO_Cteni", false)
+        set_value("g_FIFO_Full", false)
+        set_value("g_FIFO_Init", false)
+    end
+
+    set_value("g_current_trigger", get_standard_digital_in(1)) --DI 1 rising edge trigger
+    if get_value("g_current_trigger") and not get_value("g_prev_trigger") then
+        set_value("g_FIFO_Zapis", true)
+    end
+
+    if get_value("g_FIFO_Zapis") then
+        local idx = get_value("g_FIFO_Index")
+        if idx <= 6 then
+            local queue = get_value("g_FIFO_queue")
+            queue[idx] = read_encoder_count()
+            set_value("g_FIFO_queue", queue)
+            if idx < 6 then
+                set_value("g_FIFO_Index", idx + 1)
+            else
+                set_value("g_FIFO_Full", true)
+            end
+        end
+        set_value("g_FIFO_Zapis", false)
+    end
+
+    if get_value("g_FIFO_Cteni") then
+        local queue = get_value("g_FIFO_queue")
+        local idx = get_value("g_FIFO_Index")
+        for i = 1, 5, 1 do
+            queue[i] = queue[i + 1]
+        end
+        queue[6] = 0
+        if idx > 1 then
+            set_value("g_FIFO_Index", idx - 1)
+        end
+        set_value("g_FIFO_Full", false)
+        set_value("g_FIFO_queue", queue)
+        set_value("g_FIFO_Cteni", false)
+    end
+
+    set_value("g_FIFO_actual", get_value("g_FIFO_queue")[1])
+    set_value("g_prev_trigger", get_value("g_current_trigger"))
+    sleep(10)
+end
