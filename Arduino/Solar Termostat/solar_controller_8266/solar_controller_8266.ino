@@ -1,4 +1,4 @@
-ADDR_PANEL_ZAPAD/*
+ ADDR_PANEL_ZAPAD/*
  * ═══════════════════════════════════════════════════════════════
  *  Solar Water Heater Controller  —  NodeMCU ESP8266
  * ═══════════════════════════════════════════════════════════════
@@ -262,7 +262,7 @@ void connectWiFi() {
     yield();
   }
   wifiOk = (WiFi.status() == WL_CONNECTED);
-  if (wifiOk) {
+  if (wifiOk) { 
     Serial.print(F("\nConnected, IP: "));
     Serial.println(WiFi.localIP());
   } else {
