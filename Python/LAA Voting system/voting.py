@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """General Assembly voting. Run: python3 voting.py [port] [admin_key]  (Python 3.8+, no installs)."""
-import os, unicodedata, time, zlib, base64, re, json, sqlite3, sys, secrets, socket, threading, csv, io
+import zipfile, os, unicodedata, time, zlib, base64, re, json, sqlite3, sys, secrets, socket, threading, csv, io
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -11,14 +11,16 @@ LOCK = threading.Lock()
 DB.executescript("""
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY, licence TEXT UNIQUE COLLATE NOCASE, name TEXT, present INTEGER DEFAULT 1, pin TEXT);
 CREATE TABLE IF NOT EXISTS ballots(id INTEGER PRIMARY KEY, member_id INTEGER, label TEXT, club TEXT);
-CREATE TABLE IF NOT EXISTS votes(id INTEGER PRIMARY KEY, title TEXT, secret INTEGER, options TEXT, status TEXT DEFAULT 'open', eligible INTEGER);
+CREATE TABLE IF NOT EXISTS votes(id INTEGER PRIMARY KEY, title TEXT, secret INTEGER, options TEXT, status TEXT DEFAULT 'open', eligible INTEGER, code TEXT, live INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cast(vote_id INTEGER, ballot_id INTEGER, PRIMARY KEY(vote_id, ballot_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tally(vote_id INTEGER, choice TEXT, n INTEGER, PRIMARY KEY(vote_id, choice));
 CREATE TABLE IF NOT EXISTS open_choices(vote_id INTEGER, ballot_id INTEGER, choice TEXT);
+CREATE TABLE IF NOT EXISTS confirmed(vote_id INTEGER, member_id INTEGER, PRIMARY KEY(vote_id, member_id));
 CREATE TABLE IF NOT EXISTS roster(licence TEXT PRIMARY KEY COLLATE NOCASE, name TEXT, club TEXT, voting INTEGER DEFAULT 1);
 """)
-try: DB.execute("ALTER TABLE members ADD COLUMN pin TEXT")  # older databases
-except sqlite3.OperationalError: pass
+for _alter in ("ALTER TABLE members ADD COLUMN pin TEXT", "ALTER TABLE votes ADD COLUMN code TEXT", "ALTER TABLE votes ADD COLUMN live INTEGER DEFAULT 0"):  # older databases
+    try: DB.execute(_alter)
+    except sqlite3.OperationalError: pass
 
 PUBLIC_URL = ""
 # QR generator (qrcode-generator by Kazuhiko Arase, MIT license), embedded so it works without internet
@@ -40,17 +42,17 @@ def counts():
 
 def votes():
     out = []
-    for vid, title, secret, opts, status, elig in q("SELECT id,title,secret,options,status,eligible FROM votes ORDER BY id DESC"):
+    for vid, title, secret, opts, status, elig, live in q("SELECT id,title,secret,options,status,eligible,live FROM votes ORDER BY id DESC"):
         opts = json.loads(opts); t = dict(q("SELECT choice,n FROM tally WHERE vote_id=?", (vid,)))
         out.append({"id": vid, "title": title, "secret": bool(secret), "options": opts,
-                    "tally": {o: t.get(o, 0) for o in opts}, "status": status, "eligible": elig,
+                    "tally": {o: t.get(o, 0) for o in opts}, "status": status, "eligible": elig, "live": bool(live),
                     "cast": q("SELECT COUNT(*) FROM cast WHERE vote_id=?", (vid,))[0][0]})
     return out
 
 def state():
     p, b = counts(); vs = votes()
     op = next((dict(v) for v in vs if v["status"] == "open"), None)
-    if op: op.pop("tally")  # no live results for voters/screen
+    if op and not op["live"]: op.pop("tally")  # live results only when the chair enables them
     return {"url": PUBLIC_URL, "people": p, "ballots": b, "open": op, "last": next((v for v in vs if v["status"] == "closed"), None), "closed": [v for v in vs if v["status"] == "closed"]}
 
 def norm(s):
@@ -69,11 +71,13 @@ def me(lic, pin=""):
     for bid, label in q("SELECT id,label FROM ballots WHERE member_id=? ORDER BY id", (mid,)):
         voted = bool(op) and bool(q("SELECT 1 FROM cast WHERE vote_id=? AND ballot_id=?", (op["id"], bid)))
         bl.append({"id": bid, "label": label, "voted": voted})
-    return {"name": name, "ballots": bl, "open": op}
+    conf = bool(op) and bool(q("SELECT 1 FROM confirmed WHERE vote_id=? AND member_id=?", (op["id"], mid)))
+    return {"name": name, "ballots": bl, "open": op, "confirmed": conf}
 
 def cast(lic, pin, bid, choice):
     m = me(lic, pin); op = m["open"]
     if not op: raise ValueError("Žádné hlasování právě neprobíhá.")
+    if not m["confirmed"]: raise ValueError("Nejprve potvrďte přítomnost kódem z promítacího plátna.")
     if bid not in [b["id"] for b in m["ballots"]]: raise ValueError("Toto není váš hlas.")
     if choice not in op["options"]: raise ValueError("Neplatná volba.")
     try: DB.execute("INSERT INTO cast VALUES(?,?)", (op["id"], bid))
@@ -81,6 +85,18 @@ def cast(lic, pin, bid, choice):
     DB.execute("INSERT INTO tally VALUES(?,?,1) ON CONFLICT(vote_id,choice) DO UPDATE SET n=n+1", (op["id"], choice))
     if not op["secret"]: DB.execute("INSERT INTO open_choices VALUES(?,?,?)", (op["id"], bid, choice))
     DB.commit()  # secret votes: only counts are stored, nothing links a choice to a ballot
+
+def vote_code():
+    r = q("SELECT code FROM votes WHERE status='open'"); return r[0][0] if r else None
+
+def confirm(lic, pin, code):
+    m = me(lic, pin); op = m["open"]
+    if not op: raise ValueError("Žádné hlasování právě neprobíhá.")
+    if m["confirmed"]: return
+    if not secrets.compare_digest(str(code).encode(), (vote_code() or "-").encode()):
+        fail("L" + norm(lic)); raise AuthError("Nesprávný kód. Opište číslo z promítacího plátna.")
+    mid = q("SELECT id FROM members WHERE licence=?", (norm(lic),))[0][0]
+    DB.execute("INSERT OR IGNORE INTO confirmed VALUES(?,?)", (op["id"], mid)); DB.commit()
 
 def checkin(d):
     lic = norm(d.get("licence", "")); name = str(d.get("name", "")).strip(); club = str(d.get("club", "")).strip()
@@ -108,7 +124,7 @@ def open_vote(d):
     if q("SELECT 1 FROM votes WHERE status='open'"): raise ValueError("Nejprve ukončete probíhající hlasování.")
     title = str(d.get("title", "")).strip(); opts = [str(o).strip() for o in d.get("options", []) if str(o).strip()]
     if not title or len(opts) < 2 or len(set(opts)) < len(opts): raise ValueError("Zadejte otázku a alespoň 2 různé možnosti.")
-    DB.execute("INSERT INTO votes(title,secret,options) VALUES(?,?,?)", (title, int(bool(d.get("secret"))), json.dumps(opts))); DB.commit()
+    DB.execute("INSERT INTO votes(title,secret,options,code,live) VALUES(?,?,?,?,?)", (title, int(bool(d.get("secret"))), json.dumps(opts), "%04d" % secrets.randbelow(10000), int(bool(d.get("live"))))); DB.commit()
 
 def close_vote(d):
     DB.execute("UPDATE votes SET status='closed', eligible=(SELECT COUNT(*) FROM ballots b JOIN members m ON m.id=b.member_id WHERE m.present=1) WHERE status='open'"); DB.commit()
@@ -156,7 +172,56 @@ def admin_status():
     for mid, lic, name, pr, pin in q("SELECT id,licence,name,present,pin FROM members ORDER BY id DESC"):
         ms.append({"licence": lic, "name": name, "pin": pin, "present": bool(pr), "ballots": [x[0] for x in q("SELECT label FROM ballots WHERE member_id=? ORDER BY id", (mid,))]})
     return {"people": p, "ballots": b, "members": ms, "votes": votes(), "roster": q("SELECT COUNT(*) FROM roster")[0][0],
-            "roster_present": q("SELECT COUNT(*) FROM roster r JOIN members m ON m.licence=r.licence WHERE m.present=1")[0][0]}
+            "roster_present": q("SELECT COUNT(*) FROM roster r JOIN members m ON m.licence=r.licence WHERE m.present=1")[0][0],
+            "code": vote_code(), "confirmed": q("SELECT COUNT(*) FROM confirmed c JOIN votes v ON v.id=c.vote_id WHERE v.status='open'")[0][0]}
+
+class Pct(float): pass
+
+def xlsx(sheets):
+    """Minimal .xlsx writer (standard library only). sheets = [(name, rows)], first row = header."""
+    from xml.sax.saxutils import escape
+    esc = lambda t: escape(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(t)))
+    def col(i):
+        r_ = ""; i += 1
+        while i: i, m = divmod(i - 1, 26); r_ = chr(65 + m) + r_
+        return r_
+    def cell(r, c, v):
+        ref = col(c) + str(r + 1); st = ' s="1"' if r == 0 else (' s="2"' if isinstance(v, Pct) else "")
+        if isinstance(v, (int, float)) and not isinstance(v, bool): return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(float(v)) if isinstance(v, float) else v)
+        return '<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, st, esc(v))
+    X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'; NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    RN = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    parts = {}
+    for i, (name, rows) in enumerate(sheets, 1):
+        ncol = max(len(r) for r in rows)
+        wd = [min(60, max([7 if isinstance(r[c], Pct) else len(str(r[c])) for r in rows if c < len(r)] + [8]) + 2) for c in range(ncol)]
+        cols = "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (c + 1, c + 1, w) for c, w in enumerate(wd))
+        data = "".join('<row r="%d">%s</row>' % (r + 1, "".join(cell(r, c, v) for c, v in enumerate(row))) for r, row in enumerate(rows))
+        parts["xl/worksheets/sheet%d.xml" % i] = X + '<worksheet %s><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>%s</cols><sheetData>%s</sheetData></worksheet>' % (NS, cols, data)
+    n = len(sheets)
+    parts["[Content_Types].xml"] = X + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + "".join('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i for i in range(1, n + 1)) + "</Types>"
+    parts["_rels/.rels"] = X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="%s/officeDocument" Target="xl/workbook.xml"/></Relationships>' % RN
+    parts["xl/workbook.xml"] = X + '<workbook %s xmlns:r="%s"><sheets>%s</sheets></workbook>' % (NS, RN, "".join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (esc(nm)[:31], i, i) for i, (nm, _) in enumerate(sheets, 1)))
+    parts["xl/_rels/workbook.xml.rels"] = X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">%s<Relationship Id="rId%d" Type="%s/styles" Target="styles.xml"/></Relationships>' % ("".join('<Relationship Id="rId%d" Type="%s/worksheet" Target="worksheets/sheet%d.xml"/>' % (i, RN, i) for i in range(1, n + 1)), n + 1, RN)
+    parts["xl/styles.xml"] = X + '<styleSheet %s><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9E2F3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="9" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>' % NS
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", parts.pop("[Content_Types].xml"))
+        for k, v in parts.items(): z.writestr(k, v)
+    return buf.getvalue()
+
+def xlsx_export():
+    res = [["Č.", "Otázka", "Druh", "Stav", "Odevzdáno", "Oprávněno (hlasů)", "Možnost", "Počet", "Podíl"]]
+    for v in reversed(votes()):
+        for o in v["options"]:
+            n = v["tally"][o]
+            res.append([v["id"], v["title"], "tajné" if v["secret"] else "veřejné", "probíhá" if v["status"] == "open" else "ukončeno",
+                        v["cast"], v["eligible"] if v["eligible"] is not None else "", o, n, Pct(n / v["cast"] if v["cast"] else 0)])
+    att = [["Licence", "Jméno", "Přítomen", "Hlasy"]]
+    for m in admin_status()["members"]: att.append([m["licence"], m["name"], "ano" if m["present"] else "ne", "; ".join(m["ballots"])])
+    pub = [["Č.", "Otázka", "Hlas", "Jméno", "Licence", "Volba"]]
+    for r in q("SELECT v.id,v.title,b.label,m.name,m.licence,c.choice FROM open_choices c JOIN votes v ON v.id=c.vote_id JOIN ballots b ON b.id=c.ballot_id JOIN members m ON m.id=b.member_id ORDER BY v.id,m.name"): pub.append(list(r))
+    return xlsx([("Výsledky", res), ("Prezence", att), ("Veřejné hlasy", pub)])
 
 def export():
     o = io.StringIO(); w = csv.writer(o); w.writerow(["PREZENCE"]); w.writerow(["licence", "jméno", "přítomen", "hlasy"])
@@ -177,9 +242,10 @@ async function api(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify
 async function refresh(){show(await api("/api/me",{licence:lic,pin:pin}))}
 function start(){clearInterval(timer);timer=setInterval(()=>refresh().catch(()=>{}),3000)}
 function login(msg){clearInterval(timer);last="";app.replaceChildren(el("h2",{},"Valná hromada – hlasování"),el("div",{style:"display:flex;align-items:center;gap:8px"},el("b",{},"PL"),el("input",{id:"l",placeholder:"12345",inputMode:"numeric",autocomplete:"off",oninput:e=>{e.target.value=e.target.value.replace(/\D/g,"").slice(0,5)},onkeydown:e=>{if(e.key=="Enter")$("#g").click()}})),el("input",{id:"p",placeholder:"PIN (dostanete při prezenci)",type:"password",inputMode:"numeric",autocomplete:"off",oninput:e=>{e.target.value=e.target.value.replace(/\D/g,"").slice(0,4)},onkeydown:e=>{if(e.key=="Enter")$("#g").click()}}),el("button",{id:"g",onclick:async()=>{lic="PL "+$("#l").value.trim();pin=$("#p").value.trim();try{await refresh();sessionStorage.setItem("lic",lic);sessionStorage.setItem("pin",pin);start()}catch(e){login(e.message)}}},"Přihlásit"),el("p",{className:"err"},msg||""))}
-function show(d){const k=JSON.stringify(d);if(k===last)return;last=k;app.replaceChildren(el("h3",{},d.name));const o=d.open;
+function show(d){const k=JSON.stringify([d.name,d.ballots,d.open&&d.open.id,d.confirmed]);if(k===last)return;last=k;app.replaceChildren(el("h3",{},d.name));const o=d.open;
 if(!o){app.append(el("p",{},"Čekejte na další hlasování…"));return}
 app.append(el("h2",{},o.title),el("p",{},o.secret?"🔒 Tajné hlasování":"Veřejné hlasování (vaše jméno se zaznamená)"));
+if(!d.confirmed){app.append(el("p",{},"Potvrďte, že jste v sále: opište kód z promítacího plátna."),el("input",{id:"c",placeholder:"Kód z plátna",type:"tel",inputMode:"numeric",autocomplete:"off",oninput:e=>{e.target.value=e.target.value.replace(/\D/g,"").slice(0,4)},onkeydown:e=>{if(e.key=="Enter")$("#cg").click()}}),el("button",{id:"cg",onclick:async()=>{try{await api("/api/confirm",{licence:lic,pin:pin,code:$("#c").value.trim()});await refresh()}catch(e){alert(e.message)}}},"Potvrdit přítomnost"));return}
 for(const b of d.ballots){const c=el("div",{className:"card"},el("b",{},b.label));
 if(b.voted)c.append(el("p",{className:"ok"},"✓ Hlas odevzdán"));
 else for(const x of o.options)c.append(el("button",{onclick:async()=>{if(!confirm(b.label+": "+x+"?"))return;try{await api("/api/cast",{licence:lic,pin:pin,ballot_id:b.id,choice:x});await refresh()}catch(e){alert(e.message);refresh()}}},x));
@@ -192,17 +258,21 @@ const NS="http://www.w3.org/2000/svg",svg=document.createElementNS(NS,"svg");svg
 let a=0;const lg=el("div");
 v.options.forEach((o,i)=>{const n=v.tally[o],f=n/T,c=C[i%C.length];
 if(f>0){let p;if(f>=1){p=document.createElementNS(NS,"circle");p.setAttribute("r","1")}else{const a2=a+f*2*Math.PI;p=document.createElementNS(NS,"path");p.setAttribute("d","M0 0L"+Math.cos(a)+" "+Math.sin(a)+"A1 1 0 "+(f>.5?1:0)+" 1 "+Math.cos(a2)+" "+Math.sin(a2)+"Z");a=a2}p.setAttribute("fill",c);svg.append(p)}
-lg.append(el("div",{},el("span",{style:"display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;background:"+c}),o+": "+n+" ("+Math.round(100*f)+"%)"))});
+lg.append(el("div",{},el("span",{style:"display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;background:"+c}),o+": "+Math.round(n)+" ("+Math.round(100*f)+"%)"))});
 w.append(svg,lg);return w}"""
 
 SCREEN = CSS + r"""<title>Promítání</title><style>body{max-width:900px;font-size:28px}</style><div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap"><h1>Hlasujte na <span id=u></span></h1><div id=q style="width:260px;background:#fff;padding:6px;border-radius:8px"></div></div><div id=s></div><script src=/qr.js></script><script>
 //PIE
 const $=s=>document.querySelector(s);
 const el=(t,p,...c)=>{const e=document.createElement(t);Object.assign(e,p||{});e.append(...c);return e};
-async function tick(){const d=await (await fetch("/api/state")).json(),s=$("#s");if(!window.qd){window.qd=1;const U=/^(localhost|127\.)/.test(location.hostname)&&d.url?d.url:location.origin+"/";$("#u").textContent=U.replace(/^https?:\/\//,"");const qr=qrcode(0,"M");qr.addData(U);qr.make();$("#q").innerHTML=qr.createSvgTag({scalable:true,margin:0});$("#q").firstChild.style.width="100%"}s.replaceChildren(el("p",{},"Přítomno: "+d.people+" osob · "+d.ballots+" hlasů (pro usnášeníschopnost)"));
-if(d.open)s.append(el("h2",{},d.open.title),el("p",{},"Hlasování probíhá — odevzdáno "+d.open.cast+" z "+d.ballots+" hlasů"));
+let cur=null,curId=null,raf=0;
+function animate(o){if(curId!==o.id){cur=null;curId=o.id}const w=el("div"),to=o.tally,from=cur||{},t0=performance.now();$("#s").append(w);cancelAnimationFrame(raf);
+const step=now=>{const k=Math.min(1,(now-t0)/800),e=1-(1-k)*(1-k),tl={};for(const x of o.options)tl[x]=(from[x]||0)+(to[x]-(from[x]||0))*e;w.replaceChildren(pie({options:o.options,tally:tl},300));if(k<1)raf=requestAnimationFrame(step);else cur=to};step(t0);raf=requestAnimationFrame(step)}
+async function tick(){const d=await (await fetch("/api/state")).json(),s=$("#s"),K=new URLSearchParams(location.search).get("key");if(!window.qd){window.qd=1;const U=/^(localhost|127\.)/.test(location.hostname)&&d.url?d.url:location.origin+"/";$("#u").textContent=U.replace(/^https?:\/\//,"");const qr=qrcode(0,"M");qr.addData(U);qr.make();$("#q").innerHTML=qr.createSvgTag({scalable:true,margin:0});$("#q").firstChild.style.width="100%"}let code=null;if(d.open&&K){try{code=(await (await fetch("/api/admin/code",{headers:{"X-Admin":K}})).json()).code}catch(e){}}
+s.replaceChildren(el("p",{},"Přítomno: "+d.people+" osob · "+d.ballots+" hlasů (pro usnášeníschopnost)"));
+if(d.open){s.append(el("h2",{},d.open.title),code?el("div",{style:"font-size:110px;font-weight:bold;letter-spacing:14px;margin:8px 0"},code):el("p",{},"(kód se zobrazí na promítání otevřeném ze správy)"),el("p",{},"Opište kód v telefonu a potvrďte přítomnost. Odevzdáno "+d.open.cast+" z "+d.ballots+" hlasů"));if(d.open.tally)animate(d.open)}
 else if(d.last){const v=d.last;s.append(el("h2",{},v.title),el("p",{},"Odevzdáno "+v.cast+" z "+v.eligible+" hlasů"));
-s.append(pie(v,300))}
+animate(v)}
 else s.append(el("p",{},"Zatím žádné hlasování."))}
 tick();setInterval(()=>tick().catch(()=>{}),2000);
 </script>"""
@@ -213,8 +283,8 @@ ADMIN = CSS + r"""<title>Správa</title><h2>Správa valné hromady</h2>
 <div class=card><h3>Prezence</h3><input id=sr placeholder="🔍 Hledat v seznamu (jméno, licence, klub)" autocomplete=off><div id=sres></div><p style="margin:8px 0 0;opacity:.7">Nebo ručně (mimo seznam):</p><div style="display:flex;align-items:center;gap:8px"><b>PL</b><input id=lic placeholder="12345" inputmode=numeric autocomplete=off oninput="this.value=this.value.replace(/\D/g,'').slice(0,5)"></div><input id=nm placeholder="Jméno a příjmení"><input id=cl placeholder="Zastupuje klub (nepovinné)"><button id=ci>Zapsat</button><p id=cm style="font-size:26px;font-weight:bold"></p></div>
 <div class=card><h3 id=att></h3><div id=mem></div></div>
 <div class=card><h3>Seznam členů</h3><input type=file id=rf accept=".csv"><p id=rm></p></div>
-<div class=card><h3>Nové hlasování</h3><input id=ti placeholder="Otázka"><input id=op value="Ano,Ne,Zdržel se"><label><input type=checkbox id=se style="width:auto"> Tajné hlasování</label><button id=ov>Zahájit hlasování</button><p id=vm class=err></p></div>
-<div class=card id=cur></div><div id=hist></div><p><a id=ex>Stáhnout CSV (prezence + výsledky)</a></p></div>
+<div class=card><h3>Nové hlasování</h3><input id=ti placeholder="Otázka"><input id=op value="Ano,Ne,Zdržel se"><label><input type=checkbox id=se style="width:auto"> Tajné hlasování</label><br><label><input type=checkbox id=lv style="width:auto"> Průběžné výsledky na plátně (u tajného hlasování nedoporučeno)</label><button id=ov>Zahájit hlasování</button><p id=vm class=err></p></div>
+<div class=card id=cur></div><div id=hist></div><p><a id=ex2>Stáhnout Excel (.xlsx): výsledky, prezence, veřejné hlasy</a></p><p><a id=ex>Stáhnout CSV</a></p><p><a id=pl target=_blank>Otevřít promítání (s kódem)</a></p></div>
 <script>
 const $=s=>document.querySelector(s);let K="";
 const el=(t,p,...c)=>{const e=document.createElement(t);Object.assign(e,p||{});e.append(...c);return e};
@@ -225,10 +295,10 @@ async function tick(){const d=await api("/api/admin/status");$("#att").textConte
 $("#mem").replaceChildren(...d.members.map(m=>el("div",{className:"row"},el("span",{style:m.present?"":"opacity:.5"},m.name+" ("+m.licence+") PIN "+m.pin+" · "+m.ballots.length+"×"),
 el("button",{className:"s",onclick:()=>act(m.present?"checkout":"checkin",{licence:m.licence,name:m.name})},m.present?"Odejít":"Zpět"))));
 const cur=d.votes.find(v=>v.status=="open");$("#cur").hidden=!cur;
-if(cur)$("#cur").replaceChildren(el("h3",{},"Probíhá: "+cur.title),el("p",{},(cur.secret?"🔒 tajné · ":"veřejné · ")+"odevzdáno "+cur.cast+" z "+d.ballots),...tl(cur),el("button",{onclick:()=>act("close",{})},"Ukončit hlasování"));
+if(cur)$("#cur").replaceChildren(el("h3",{},"Probíhá: "+cur.title),el("p",{},(cur.secret?"🔒 tajné · ":"veřejné · ")+"odevzdáno "+cur.cast+" z "+d.ballots),el("p",{},"Kód na plátně: "+d.code+" · potvrdilo přítomnost: "+d.confirmed),...tl(cur),el("button",{onclick:()=>act("close",{})},"Ukončit hlasování"));
 $("#hist").replaceChildren(...d.votes.filter(v=>v.status=="closed").map(v=>el("div",{className:"card"},el("b",{},v.title+(v.secret?" 🔒":"")),el("div",{},"Odevzdáno "+v.cast+" z "+v.eligible),...tl(v),pie(v,160))))}
 async function act(a,b){try{await api("/api/admin/"+a,b);tick()}catch(e){alert(e.message)}}
-$("#go").onclick=async()=>{K=$("#key").value;try{await tick();$("#gate").hidden=true;$("#main").hidden=false;$("#ex").href="/api/admin/export?key="+encodeURIComponent(K);setInterval(()=>tick().catch(()=>{}),2000)}catch(e){$("#ge").textContent=e.message}};
+$("#go").onclick=async()=>{K=$("#key").value;try{await tick();$("#gate").hidden=true;$("#main").hidden=false;$("#ex").href="/api/admin/export?key="+encodeURIComponent(K);$("#ex2").href="/api/admin/export.xlsx?key="+encodeURIComponent(K);$("#pl").href="/screen?key="+encodeURIComponent(K);setInterval(()=>tick().catch(()=>{}),2000)}catch(e){$("#ge").textContent=e.message}};
 $("#ci").onclick=async()=>{try{const r=await api("/api/admin/checkin",{licence:"PL "+$("#lic").value,name:$("#nm").value,club:$("#cl").value});$("#cm").textContent="✓ "+$("#nm").value+" — PIN: "+r.pin;for(const i of["lic","nm","cl"])$("#"+i).value="";$("#cm").className="ok";tick()}catch(e){$("#cm").textContent=e.message;$("#cm").className="err"}};
 async function srch(){const v=$("#sr").value.trim();if(!v){$("#sres").replaceChildren();return}
 const r=await api("/api/admin/roster?q="+encodeURIComponent(v));
@@ -237,7 +307,7 @@ function pick(m){if(!m.voting&&!confirm(m.name+" nemá hlasovací právo. Přest
 $("#sr").oninput=()=>srch().catch(()=>{});
 $("#sr").onkeydown=e=>{if(e.key=="Enter"){const b=$("#sres").querySelector("button:not(:disabled)");if(b)b.click()}};
 $("#rf").onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const r=await api("/api/admin/roster",{csv:await f.text()});$("#rm").textContent="Načteno: "+r.imported+", přeskočeno: "+r.skipped;tick()}catch(x){$("#rm").textContent=x.message}};
-$("#ov").onclick=async()=>{try{await api("/api/admin/open",{title:$("#ti").value,options:$("#op").value.split(","),secret:$("#se").checked});$("#vm").textContent="";$("#ti").value="";tick()}catch(e){$("#vm").textContent=e.message}};
+$("#ov").onclick=async()=>{try{await api("/api/admin/open",{title:$("#ti").value,options:$("#op").value.split(","),secret:$("#se").checked,live:$("#lv").checked});$("#vm").textContent="";$("#ti").value="";tick()}catch(e){$("#vm").textContent=e.message}};
 for(const[i,b]of[["key","go"],["lic","ci"],["nm","ci"],["cl","ci"],["ti","ov"],["op","ov"]])$("#"+i).onkeydown=e=>{if(e.key=="Enter")$("#"+b).click()};
 </script>"""
 
@@ -257,6 +327,9 @@ SCREEN = SCREEN.replace("//PIE", PIE); ADMIN = ADMIN.replace("//PIE", PIE)
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def sendb(self, b, ctype, fname):
+        self.send_response(200); self.send_header("Content-Type", ctype); self.send_header("Content-Disposition", 'attachment; filename="%s"' % fname)
+        self.send_header("Content-Length", str(len(b))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(b)
     def send(self, body, ctype="application/json", code=200):
         b = body.encode()
         self.send_response(code); self.send_header("Content-Type", ctype + "; charset=utf-8")
@@ -274,11 +347,13 @@ class H(BaseHTTPRequestHandler):
             if p in pages: return self.send(pages[p], "text/html")
             if p == "/api/state":
                 with LOCK: return self.js(state())
-            if p in ("/api/admin/status", "/api/admin/export", "/api/admin/roster"):
+            if p in ("/api/admin/status", "/api/admin/export", "/api/admin/roster", "/api/admin/code", "/api/admin/export.xlsx"):
                 if too_many("A" + self.ip(), 10, 60): return self.js({"error": "Příliš mnoho pokusů. Zkuste to za minutu."}, 429)
                 if not self.is_admin(): fail("A" + self.ip()); return self.js({"error": "Nesprávný klíč správce."}, 403)
                 with LOCK:
                     if p.endswith("status"): return self.js(admin_status())
+                    if p.endswith(".xlsx"): return self.sendb(xlsx_export(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "hlasovani-%s.xlsx" % time.strftime("%Y-%m-%d"))
+                    if p.endswith("code"): return self.js({"code": vote_code()})
                     if p.endswith("roster"): return self.js(roster_search(parse_qs(urlparse(self.path).query).get("q", [""])[0]))
                     return self.send("\ufeff" + export(), "text/csv")
             self.js({"error": "Nenalezeno"}, 404)
@@ -292,6 +367,8 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 try:
                     if p == "/api/me": out = me(str(d.get("licence", "")).strip(), d.get("pin", ""))
+                    elif p == "/api/confirm":
+                        confirm(str(d.get("licence", "")).strip(), d.get("pin", ""), str(d.get("code", "")).strip()); out = {"ok": 1}
                     elif p == "/api/cast":
                         cast(str(d.get("licence", "")).strip(), d.get("pin", ""), d.get("ballot_id"), d.get("choice")); out = {"ok": 1}
                     elif p.startswith("/api/admin/") and p[11:] in admin:
@@ -313,7 +390,7 @@ def lan_ip():
 if __name__ == "__main__":
     ip = lan_ip()
     PUBLIC_URL = os.environ.get("PUBLIC_URL") or "http://%s:%d/" % (ip, PORT)
-    print("Hlasující (do QR kódu): http://%s:%d/\nPromítání:                   http://%s:%d/screen\nSpráva / prezence:           http://%s:%d/admin   klíč: %s" % (ip, PORT, ip, PORT, ip, PORT, ADMIN_KEY if not os.environ.get("ADMIN_KEY") else "(z proměnné ADMIN_KEY)"))
+    print("Hlasující (do QR kódu): http://%s:%d/\nPromítání (s kódem: odkaz ve správě): http://%s:%d/screen\nSpráva / prezence:           http://%s:%d/admin   klíč: %s" % (ip, PORT, ip, PORT, ip, PORT, ADMIN_KEY if not os.environ.get("ADMIN_KEY") else "(z proměnné ADMIN_KEY)"))
     rp = os.environ.get("ROSTER") or next((f for f in ("clenove.db", "roster.csv") if os.path.exists(f)), None)
     if rp:
         try: r = load_roster_file(rp); print("Seznam členů: %s — načteno %d, přeskočeno %d" % (rp, r["imported"], r["skipped"]))
