@@ -1,0 +1,23 @@
+
+ROUTINE update_errcode
+VAR
+  stat : INTEGER
+BEGIN
+  IF err_reset_req THEN
+    err_reset_req = FALSE
+    err_latched = FALSE             -- search again from the beginning
+  ENDIF
+  IF err_latched THEN
+    RETURN                          -- wait for the reset
+  ENDIF
+
+  collect_errors
+  IF cur_n = 0 THEN
+    write_group(out_errcode, fo_errcode, 16, 0)
+    SET_PORT_VAL(io_gpout, 50, 0, stat)
+  ELSE
+    write_group(out_errcode, fo_errcode, 16, cur_list[1])
+    SET_PORT_VAL(io_gpout, 50, cur_list[1], stat)
+    err_latched = TRUE
+  ENDIF
+END update_errcode
